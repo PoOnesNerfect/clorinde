@@ -411,6 +411,27 @@ pub mod error {
             #[label("unknown named {ty}")]
             pos: SourceSpan,
         },
+        #[error("table struct `{name}` was not generated")]
+        #[diagnostic(help("enable `tables.generate-batch-ops` and include this table in config"))]
+        TableStructNotGenerated {
+            #[source_code]
+            src: NamedSource<Arc<String>>,
+            name: String,
+            #[label("referenced here")]
+            pos: SourceSpan,
+        },
+        #[error("query `{query}` does not match table struct `{table}` columns")]
+        #[diagnostic(help("expected columns: {expected}; got: {actual}"))]
+        TableStructShapeMismatch {
+            #[source_code]
+            src: NamedSource<Arc<String>>,
+            table: String,
+            query: String,
+            expected: String,
+            actual: String,
+            #[label("row annotation")]
+            pos: SourceSpan,
+        },
         #[error("unknown field")]
         #[diagnostic(help("use one of those names: {known}"))]
         UnknownFieldName {

@@ -7,6 +7,7 @@ mod load_schema;
 mod parser;
 mod prepare_queries;
 mod read_queries;
+mod schema_introspection;
 mod type_registrar;
 mod utils;
 mod validation;
@@ -45,9 +46,27 @@ pub fn gen_live(client: &Client, config: Config) -> Result<(), Error> {
         .map(parse_query_module)
         .collect::<Result<_, parser::error::Error>>()?;
 
+    // Introspect database schema if batch ops generation is enabled
+    let table_schemas = if config.tables.generate_batch_ops {
+        schema_introspection::introspect_tables(
+            client,
+            &config.tables.schema,
+            &config.tables.include_tables,
+            &config.tables.exclude_tables,
+        ).map_err(|e| Error::SchemaIntrospection(e.to_string()))?
+    } else {
+        Vec::new()
+    };
+
+    let table_schemas_opt = if table_schemas.is_empty() {
+        None
+    } else {
+        Some(table_schemas)
+    };
+
     // Generate
-    let prepared_modules = prepare(client, modules, &config)?;
-    let generated = codegen::gen(prepared_modules, &config);
+    let prepared_modules = prepare(client, modules, &config, table_schemas_opt.as_deref())?;
+    let generated = codegen::gen(prepared_modules, &config, table_schemas_opt);
 
     // Write
     generated.persist(config.destination, config.static_files)?;
@@ -77,8 +96,27 @@ pub fn gen_managed<P: AsRef<Path>>(schema_files: &[P], config: Config) -> Result
 
     let client = conn::clorinde_conn()?;
     load_schema(&client, schema_files)?;
-    let prepared_modules = prepare(&client, modules, &config)?;
-    let generated = codegen::gen(prepared_modules, &config);
+
+    // Introspect database schema if batch ops generation is enabled
+    let table_schemas = if config.tables.generate_batch_ops {
+        schema_introspection::introspect_tables(
+            &client,
+            &config.tables.schema,
+            &config.tables.include_tables,
+            &config.tables.exclude_tables,
+        ).map_err(|e| Error::SchemaIntrospection(e.to_string()))?
+    } else {
+        Vec::new()
+    };
+
+    let table_schemas_opt = if table_schemas.is_empty() {
+        None
+    } else {
+        Some(table_schemas)
+    };
+
+    let prepared_modules = prepare(&client, modules, &config, table_schemas_opt.as_deref())?;
+    let generated = codegen::gen(prepared_modules, &config, table_schemas_opt);
     container::cleanup(config.podman)?;
 
     // Write
@@ -130,8 +168,26 @@ pub fn gen_fresh<P: AsRef<Path>>(
 
         load_schema(&db_client, schema_files)?;
 
-        let prepared_modules = prepare(&db_client, modules, &config)?;
-        let generated = codegen::gen(prepared_modules, &config);
+        // Introspect database schema if batch ops generation is enabled
+        let table_schemas = if config.tables.generate_batch_ops {
+            schema_introspection::introspect_tables(
+                &db_client,
+                &config.tables.schema,
+                &config.tables.include_tables,
+                &config.tables.exclude_tables,
+            ).map_err(|e| Error::SchemaIntrospection(e.to_string()))?
+        } else {
+            Vec::new()
+        };
+
+        let table_schemas_opt = if table_schemas.is_empty() {
+            None
+        } else {
+            Some(table_schemas)
+        };
+
+        let prepared_modules = prepare(&db_client, modules, &config, table_schemas_opt.as_deref())?;
+        let generated = codegen::gen(prepared_modules, &config, table_schemas_opt);
 
         generated.persist(config.destination, config.static_files)?;
 

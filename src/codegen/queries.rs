@@ -406,6 +406,7 @@ fn gen_query_fn(
             fields,
             is_copy,
             is_named,
+            skip_definition,
             ..
         } = &item;
 
@@ -415,12 +416,11 @@ fn gen_query_fn(
         if *is_named {
             let path_str = &item.path(ctx);
             let path = syn::parse_str::<syn::Path>(path_str).unwrap();
-            let path_type = syn::parse_str::<syn::Path>(&format!(
-                "{}{}",
-                path_str,
-                if *is_copy { "" } else { "Borrowed" }
-            ))
-            .unwrap();
+            let path_type = if *skip_definition || *is_copy {
+                syn::parse_str::<syn::Path>(path_str).unwrap()
+            } else {
+                syn::parse_str::<syn::Path>(&format!("{path_str}Borrowed")).unwrap()
+            };
 
             let fields_name: Vec<_> = fields
                 .iter()
@@ -439,8 +439,10 @@ fn gen_query_fn(
                 }
             };
 
-            let mapper = quote! {
-                |it| #path::from(it)
+            let mapper = if *skip_definition || *is_copy {
+                quote!(|it| it)
+            } else {
+                quote!(|it| #path::from(it))
             };
 
             quote! {
@@ -644,7 +646,7 @@ fn gen_query_module(module: &PreparedModule, config: &Config) -> proc_macro2::To
     }
 
     for row in module.rows.values() {
-        if row.is_named {
+        if row.is_named && !row.skip_definition {
             let row_tokens = gen_row_structs(row, &ctx, config);
             tokens.extend(quote!(#row_tokens));
         }
@@ -670,11 +672,6 @@ fn gen_query_module(module: &PreparedModule, config: &Config) -> proc_macro2::To
     };
 
     tokens.extend(specific_tokens);
-
-    // Generate batch operations (QueryExt implementations) if enabled
-    if let Some(batch_ops_tokens) = super::batch_ops::gen_batch_ops_module(module, config) {
-        tokens.extend(batch_ops_tokens);
-    }
 
     tokens
 }

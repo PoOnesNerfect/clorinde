@@ -247,29 +247,46 @@ impl TypeMapping {
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Tables {
-    /// Auto-generate QueryExt trait implementations for batch operations
-    /// When enabled, Clorinde will generate implementations for insert_many, update_cols, etc.
+    /// Auto-generate QueryExt trait implementations and complete table structs
+    /// Uses the same database connection as query preparation
     #[serde(rename = "generate-batch-ops")]
     pub generate_batch_ops: bool,
-    /// Module path where the QueryExt trait is defined (e.g., "common::db")
-    /// Used for generating `use` statements in the generated code
-    #[serde(rename = "trait-module")]
-    pub trait_module: String,
-    /// Custom table name mappings: Rust struct name -> SQL table name
-    /// Example: { "Restaurant" = "public.restaurants" }
-    /// If not specified, Clorinde will attempt to infer the table name from SQL queries
-    #[serde(rename = "table-mapping", default)]
-    pub table_mapping: HashMap<String, String>,
+
+    /// Database schema to introspect (e.g., "public")
+    #[serde(default = "default_schema")]
+    pub schema: String,
+
+    /// Tables to include (empty = all tables in schema)
+    #[serde(rename = "include-tables", default)]
+    pub include_tables: Vec<String>,
+
+    /// Tables to exclude from generation
+    #[serde(rename = "exclude-tables", default)]
+    pub exclude_tables: Vec<String>,
+
+    /// Suffix for generated table structs (e.g., "Table" -> RestaurantTable)
+    #[serde(rename = "table-struct-suffix", default = "default_table_suffix")]
+    pub table_struct_suffix: String,
 }
 
 impl Default for Tables {
     fn default() -> Self {
         Self {
             generate_batch_ops: false,
-            trait_module: "common::db".to_string(),
-            table_mapping: HashMap::new(),
+            schema: default_schema(),
+            include_tables: Vec::new(),
+            exclude_tables: vec!["schema_migrations".to_string()],
+            table_struct_suffix: default_table_suffix(),
         }
     }
+}
+
+fn default_schema() -> String {
+    "public".to_string()
+}
+
+fn default_table_suffix() -> String {
+    "Table".to_string()
 }
 
 #[allow(deprecated)]
@@ -477,15 +494,27 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the module path where QueryExt trait is defined
-    pub fn batch_ops_trait_module(mut self, module: impl Into<String>) -> Self {
-        self.config.tables.trait_module = module.into();
+    /// Set database schema to introspect
+    pub fn batch_ops_schema(mut self, schema: impl Into<String>) -> Self {
+        self.config.tables.schema = schema.into();
         self
     }
 
-    /// Add a table name mapping (Rust struct name -> SQL table name)
-    pub fn add_table_mapping(mut self, struct_name: impl Into<String>, table_name: impl Into<String>) -> Self {
-        self.config.tables.table_mapping.insert(struct_name.into(), table_name.into());
+    /// Set tables to include (whitelist)
+    pub fn batch_ops_include_tables(mut self, tables: Vec<String>) -> Self {
+        self.config.tables.include_tables = tables;
+        self
+    }
+
+    /// Set tables to exclude (blacklist)
+    pub fn batch_ops_exclude_tables(mut self, tables: Vec<String>) -> Self {
+        self.config.tables.exclude_tables = tables;
+        self
+    }
+
+    /// Set table struct suffix
+    pub fn batch_ops_table_suffix(mut self, suffix: impl Into<String>) -> Self {
+        self.config.tables.table_struct_suffix = suffix.into();
         self
     }
 

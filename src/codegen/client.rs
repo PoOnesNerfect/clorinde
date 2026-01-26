@@ -7,6 +7,39 @@ pub(crate) fn gen_lib(
     dependency_analysis: &DependencyAnalysis,
     config: &Config,
 ) -> proc_macro2::TokenStream {
+    gen_lib_internal(dependency_analysis, config, false)
+}
+
+pub(crate) fn gen_lib_with_tables(
+    dependency_analysis: &DependencyAnalysis,
+    config: &Config,
+) -> proc_macro2::TokenStream {
+    gen_lib_internal(dependency_analysis, config, true)
+}
+
+fn gen_lib_internal(
+    dependency_analysis: &DependencyAnalysis,
+    config: &Config,
+    include_tables: bool,
+) -> proc_macro2::TokenStream {
+    let tables_module = if include_tables {
+        quote! {
+            #[allow(clippy::all, clippy::pedantic)]
+            #[allow(unused_variables)]
+            #[allow(unused_imports)]
+            #[allow(dead_code)]
+            pub mod tables;
+
+            #[allow(clippy::all, clippy::pedantic)]
+            #[allow(unused_variables)]
+            #[allow(unused_imports)]
+            #[allow(dead_code)]
+            pub mod batch_ops;
+        }
+    } else {
+        quote! {}
+    };
+
     let base_tokens = quote! {
         #[allow(clippy::all, clippy::pedantic)]
         #[allow(unused_variables)]
@@ -19,6 +52,8 @@ pub(crate) fn gen_lib(
         #[allow(unused_imports)]
         #[allow(dead_code)]
         pub mod queries;
+
+        #tables_module
 
         pub mod client;
 

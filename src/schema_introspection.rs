@@ -1,0 +1,301 @@
+//! Database schema introspection for generating complete table definitions
+//!
+//! This module queries information_schema to retrieve complete table definitions
+//! including all columns, types, nullability, and constraints.
+
+use miette::{Diagnostic, Result};
+use std::collections::HashMap;
+use thiserror::Error;
+use tokio_postgres::Client;
+
+/// Complete definition of a database table
+#[derive(Debug, Clone)]
+pub struct TableSchema {
+    /// Table name (e.g., "restaurants")
+    pub name: String,
+    /// Schema name (e.g., "public")
+    pub schema: String,
+    /// All columns in ordinal order
+    pub columns: Vec<ColumnDef>,
+    /// Primary key column names
+    pub primary_keys: Vec<String>,
+}
+
+/// Definition of a single table column
+#[derive(Debug, Clone)]
+pub struct ColumnDef {
+    /// Column name (e.g., "google_id")
+    pub name: String,
+    /// PostgreSQL data type (e.g., "text", "bigint", "geography")
+    pub data_type: String,
+    /// UDT name for custom types (e.g., "geography")
+    pub udt_name: String,
+    /// Whether column allows NULL
+    pub is_nullable: bool,
+    /// Default value expression (if any)
+    pub column_default: Option<String>,
+    /// Position in table (1-indexed)
+    pub ordinal_position: i32,
+}
+
+/// Introspect database tables to get complete schema definitions
+///
+/// # Arguments
+/// * `client` - Active PostgreSQL client connection
+/// * `schema` - Schema name to introspect (e.g., "public")
+/// * `include_tables` - Tables to include (empty = all tables)
+/// * `exclude_tables` - Tables to exclude
+///
+/// # Returns
+/// Vector of TableSchema objects containing complete table definitions
+pub fn introspect_tables(
+    client: &Client,
+    schema: &str,
+    include_tables: &[String],
+    exclude_tables: &[String],
+) -> Result<Vec<TableSchema>, IntrospectionError> {
+    // Get list of tables to introspect
+    let tables = get_tables_list(client, schema, include_tables, exclude_tables)?;
+
+    // Introspect each table
+    let mut table_schemas = Vec::new();
+    for table_name in tables {
+        let columns = get_table_columns(client, schema, &table_name)?;
+        let primary_keys = get_primary_keys(client, schema, &table_name)?;
+
+        table_schemas.push(TableSchema {
+            name: table_name,
+            schema: schema.to_string(),
+            columns,
+            primary_keys,
+        });
+    }
+
+    Ok(table_schemas)
+}
+
+/// Get list of table names in schema
+fn get_tables_list(
+    client: &Client,
+    schema: &str,
+    include_tables: &[String],
+    exclude_tables: &[String],
+) -> Result<Vec<String>, IntrospectionError> {
+    let query = "
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = $1
+          AND table_type = 'BASE TABLE'
+        ORDER BY table_name
+    ";
+
+    let rows = futures::executor::block_on(client.query(query, &[&schema]))
+        .map_err(|e| IntrospectionError::QueryFailed(e.to_string()))?;
+
+    let mut tables: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+
+    // Apply include filter
+    if !include_tables.is_empty() {
+        tables.retain(|t| include_tables.contains(t));
+    }
+
+    // Apply exclude filter
+    tables.retain(|t| !exclude_tables.contains(t));
+
+    Ok(tables)
+}
+
+/// Get all columns for a table
+fn get_table_columns(
+    client: &Client,
+    schema: &str,
+    table_name: &str,
+) -> Result<Vec<ColumnDef>, IntrospectionError> {
+    let query = "
+        SELECT
+            column_name,
+            data_type,
+            udt_name,
+            is_nullable,
+            column_default,
+            ordinal_position
+        FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = $2
+        ORDER BY ordinal_position
+    ";
+
+    let rows = futures::executor::block_on(client.query(query, &[&schema, &table_name]))
+        .map_err(|e| IntrospectionError::QueryFailed(e.to_string()))?;
+
+    let columns = rows
+        .iter()
+        .map(|row| ColumnDef {
+            name: row.get(0),
+            data_type: row.get(1),
+            udt_name: row.get(2),
+            is_nullable: row.get::<_, String>(3) == "YES",
+            column_default: row.get(4),
+            ordinal_position: row.get(5),
+        })
+        .collect();
+
+    Ok(columns)
+}
+
+/// Get primary key columns for a table
+fn get_primary_keys(
+    client: &Client,
+    schema: &str,
+    table_name: &str,
+) -> Result<Vec<String>, IntrospectionError> {
+    let query = "
+        SELECT kcu.column_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+          AND tc.table_schema = kcu.table_schema
+        WHERE tc.constraint_type = 'PRIMARY KEY'
+          AND tc.table_schema = $1
+          AND tc.table_name = $2
+        ORDER BY kcu.ordinal_position
+    ";
+
+    let rows = futures::executor::block_on(client.query(query, &[&schema, &table_name]))
+        .map_err(|e| IntrospectionError::QueryFailed(e.to_string()))?;
+
+    let primary_keys: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+
+    Ok(primary_keys)
+}
+
+/// Map PostgreSQL type to Rust type string
+///
+/// Uses the same type mapping logic as Clorinde's existing type system
+pub fn map_postgres_type_to_rust(
+    column: &ColumnDef,
+    type_mappings: &HashMap<String, String>,
+) -> String {
+    // Check custom type mappings first (e.g., "public.geography" -> "postgis::ewkb::Geometry")
+    let full_type_name = format!("public.{}", column.udt_name);
+    if let Some(mapped_type) = type_mappings.get(&full_type_name) {
+        return if column.is_nullable {
+            format!("Option<{}>", mapped_type)
+        } else {
+            mapped_type.clone()
+        };
+    }
+
+    // Standard PostgreSQL type mappings
+    let rust_type = match column.data_type.as_str() {
+        "bigint" | "int8" => "i64",
+        "integer" | "int4" => "i32",
+        "smallint" | "int2" => "i16",
+        "boolean" | "bool" => "bool",
+        "real" | "float4" => "f32",
+        "double precision" | "float8" => "f64",
+        "text" | "varchar" | "character varying" | "char" | "character" => "String",
+        "bytea" => "Vec<u8>",
+        "timestamp" | "timestamp without time zone" => "chrono::NaiveDateTime",
+        "timestamp with time zone" | "timestamptz" => "chrono::DateTime<chrono::Utc>",
+        "date" => "chrono::NaiveDate",
+        "time" | "time without time zone" => "chrono::NaiveTime",
+        "uuid" => "uuid::Uuid",
+        "json" | "jsonb" => "serde_json::Value",
+        "numeric" | "decimal" => "rust_decimal::Decimal",
+        "ARRAY" => {
+            // Try to infer array element type from udt_name
+            // e.g., "_text" -> "Vec<String>", "_int4" -> "Vec<i32>"
+            let element_type = match column.udt_name.as_str() {
+                "_text" | "_varchar" => "String",
+                "_int8" => "i64",
+                "_int4" => "i32",
+                "_int2" => "i16",
+                "_bool" => "bool",
+                "_float4" => "f32",
+                "_float8" => "f64",
+                _ => "String", // fallback
+            };
+            return if column.is_nullable {
+                format!("Option<Vec<{}>>", element_type)
+            } else {
+                format!("Vec<{}>", element_type)
+            };
+        }
+        "USER-DEFINED" => {
+            // Custom type - use udt_name directly
+            // This includes PostGIS types, custom domains, enums
+            column.udt_name.as_str()
+        }
+        _ => {
+            eprintln!(
+                "Warning: Unknown PostgreSQL type '{}' for column '{}', using String",
+                column.data_type, column.name
+            );
+            "String"
+        }
+    };
+
+    if column.is_nullable {
+        format!("Option<{}>", rust_type)
+    } else {
+        rust_type.to_string()
+    }
+}
+
+#[derive(Debug, Error, Diagnostic)]
+pub enum IntrospectionError {
+    #[error("Failed to connect to database: {0}")]
+    ConnectionFailed(String),
+
+    #[error("Database query failed: {0}")]
+    QueryFailed(String),
+
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_type_mapping() {
+        let mappings = HashMap::new();
+
+        let col = ColumnDef {
+            name: "id".to_string(),
+            data_type: "bigint".to_string(),
+            udt_name: "int8".to_string(),
+            is_nullable: false,
+            column_default: None,
+            ordinal_position: 1,
+        };
+        assert_eq!(map_postgres_type_to_rust(&col, &mappings), "i64");
+
+        let col_nullable = ColumnDef {
+            name: "rating".to_string(),
+            data_type: "double precision".to_string(),
+            udt_name: "float8".to_string(),
+            is_nullable: true,
+            column_default: None,
+            ordinal_position: 2,
+        };
+        assert_eq!(
+            map_postgres_type_to_rust(&col_nullable, &mappings),
+            "Option<f64>"
+        );
+
+        let col_array = ColumnDef {
+            name: "tags".to_string(),
+            data_type: "ARRAY".to_string(),
+            udt_name: "_text".to_string(),
+            is_nullable: true,
+            column_default: None,
+            ordinal_position: 3,
+        };
+        assert_eq!(
+            map_postgres_type_to_rust(&col_array, &mappings),
+            "Option<Vec<String>>"
+        );
+    }
+}

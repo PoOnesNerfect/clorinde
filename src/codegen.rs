@@ -10,6 +10,7 @@ mod batch_ops;
 mod cargo;
 mod client;
 mod queries;
+mod tables;
 mod types;
 mod vfs;
 
@@ -134,17 +135,38 @@ pub fn idx_char(idx: usize) -> String {
     format!("T{idx}")
 }
 
-pub(crate) fn gen(preparation: Preparation, config: &Config) -> Vfs {
+pub(crate) fn gen(
+    preparation: Preparation,
+    config: &Config,
+    table_schemas: Option<Vec<crate::schema_introspection::TableSchema>>,
+) -> Vfs {
     let mut vfs = Vfs::empty();
     let cargo = cargo::gen_cargo_file(&preparation.dependency_analysis, config);
     vfs.add_string("Cargo.toml", cargo);
-    vfs.add(
-        "src/lib.rs",
-        client::gen_lib(&preparation.dependency_analysis, config),
-    );
+
+    // Generate lib.rs with appropriate module declarations
+    let lib_contents = if table_schemas.is_some() {
+        client::gen_lib_with_tables(&preparation.dependency_analysis, config)
+    } else {
+        client::gen_lib(&preparation.dependency_analysis, config)
+    };
+    vfs.add("src/lib.rs", lib_contents);
+
     let types = gen_type_modules(&preparation.types, config);
     vfs.add("src/types.rs", types);
     queries::gen_queries(&mut vfs, &preparation, config);
     client::gen_clients(&mut vfs, &preparation.dependency_analysis, config);
+
+    // Generate tables and batch_ops modules if schema introspection was performed
+    if let Some(ref schemas) = table_schemas {
+        if !schemas.is_empty() {
+            let tables_module = tables::gen_tables_module(schemas, config);
+            vfs.add("src/tables.rs", tables_module);
+
+            let batch_ops_module = batch_ops::gen_batch_ops_module(schemas, config);
+            vfs.add("src/batch_ops.rs", batch_ops_module);
+        }
+    }
+
     vfs
 }
