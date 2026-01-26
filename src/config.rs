@@ -53,6 +53,8 @@ pub struct Config {
     pub style: Style,
     /// Custom type settings
     pub types: Types,
+    /// Batch operations code generation settings
+    pub tables: Tables,
     /// The Cargo.toml manifest configuration
     pub manifest: cargo_toml::Manifest,
 }
@@ -126,6 +128,7 @@ impl Default for Config {
                 type_traits_mapping: HashMap::new(),
                 type_attributes_mapping: HashMap::new(),
             },
+            tables: Tables::default(),
             manifest: default_manifest(),
             style: Style::default(),
             static_files: vec![],
@@ -235,6 +238,36 @@ impl TypeMapping {
         match self {
             TypeMapping::Simple(_) => None,
             TypeMapping::Detailed { borrowed_type, .. } => borrowed_type.as_deref(),
+        }
+    }
+}
+
+/// Configuration for batch operations generation
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Tables {
+    /// Auto-generate QueryExt trait implementations for batch operations
+    /// When enabled, Clorinde will generate implementations for insert_many, update_cols, etc.
+    #[serde(rename = "generate-batch-ops")]
+    pub generate_batch_ops: bool,
+    /// Module path where the QueryExt trait is defined (e.g., "common::db")
+    /// Used for generating `use` statements in the generated code
+    #[serde(rename = "trait-module")]
+    pub trait_module: String,
+    /// Custom table name mappings: Rust struct name -> SQL table name
+    /// Example: { "Restaurant" = "public.restaurants" }
+    /// If not specified, Clorinde will attempt to infer the table name from SQL queries
+    #[serde(rename = "table-mapping", default)]
+    pub table_mapping: HashMap<String, String>,
+}
+
+impl Default for Tables {
+    fn default() -> Self {
+        Self {
+            generate_batch_ops: false,
+            trait_module: "common::db".to_string(),
+            table_mapping: HashMap::new(),
         }
     }
 }
@@ -435,6 +468,24 @@ impl ConfigBuilder {
             type_name.into(),
             traits.into_iter().map(Into::into).collect(),
         );
+        self
+    }
+
+    /// Enable batch operations generation (QueryExt implementations)
+    pub fn enable_batch_ops(mut self, enable: bool) -> Self {
+        self.config.tables.generate_batch_ops = enable;
+        self
+    }
+
+    /// Set the module path where QueryExt trait is defined
+    pub fn batch_ops_trait_module(mut self, module: impl Into<String>) -> Self {
+        self.config.tables.trait_module = module.into();
+        self
+    }
+
+    /// Add a table name mapping (Rust struct name -> SQL table name)
+    pub fn add_table_mapping(mut self, struct_name: impl Into<String>, table_name: impl Into<String>) -> Self {
+        self.config.tables.table_mapping.insert(struct_name.into(), table_name.into());
         self
     }
 

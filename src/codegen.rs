@@ -6,6 +6,7 @@ use crate::{
     prepare_queries::{Preparation, PreparedField},
 };
 
+mod batch_ops;
 mod cargo;
 mod client;
 mod queries;

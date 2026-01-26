@@ -670,6 +670,12 @@ fn gen_query_module(module: &PreparedModule, config: &Config) -> proc_macro2::To
     };
 
     tokens.extend(specific_tokens);
+
+    // Generate batch operations (QueryExt implementations) if enabled
+    if let Some(batch_ops_tokens) = super::batch_ops::gen_batch_ops_module(module, config) {
+        tokens.extend(batch_ops_tokens);
+    }
+
     tokens
 }
 
