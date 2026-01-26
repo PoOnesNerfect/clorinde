@@ -84,7 +84,7 @@ fn gen_query_ext_impl(
                 #to_params
             }
 
-            fn from_row(row: &tokio_postgres::Row) -> Result<Self, tokio_postgres::Error> {
+            fn from_row(row: tokio_postgres::Row) -> Self {
                 #from_row
             }
         }
@@ -206,17 +206,17 @@ fn gen_from_row_method(item: &PreparedItem) -> TokenStream {
             let field_name = format_ident!("{}", &field.ident.rs);
             let index = proc_macro2::Literal::usize_unsuffixed(idx);
             
-            // All fields use try_get (handles both nullable and non-nullable)
+            // Use get() instead of try_get()
             quote! {
-                #field_name: row.try_get(#index)?
+                #field_name: row.get(#index)
             }
         })
         .collect();
 
     quote! {
-        Ok(Self {
+        Self {
             #(#field_extractions),*
-        })
+        }
     }
 }
 
