@@ -22,10 +22,10 @@ use self::error::Error;
 type ModuleNestedSpecs = std::collections::HashMap<String, std::collections::HashMap<String, bool>>;
 
 #[derive(Debug, Clone)]
-struct TableStructInfo {
-    struct_name: String,
-    path: String,
-    columns: Vec<String>,
+pub(crate) struct TableStructInfo {
+    pub(crate) struct_name: String,
+    pub(crate) path: String,
+    pub(crate) columns: Vec<String>,
 }
 
 /// This data structure is used by Clorinde to generate
@@ -183,6 +183,24 @@ impl PreparedItem {
             }
             ModCtx::Queries => self.name.to_string(),
             ModCtx::ClientQueries => format!("super::{}", self.name),
+        }
+    }
+
+    /// Get the borrowed variant path for this item
+    /// For table structs with path_override, appends "Borrowed" to the struct name
+    pub fn borrowed_path(&self, ctx: &GenCtx) -> String {
+        if let Some(path) = &self.path_override {
+            // For paths like "crate::tables::UserRow", convert to "crate::tables::UserRowBorrowed"
+            return format!("{}Borrowed", path);
+        }
+
+        // For regular structs, append Borrowed to the name
+        match ctx.hierarchy {
+            ModCtx::Types | ModCtx::SchemaTypes => {
+                unreachable!()
+            }
+            ModCtx::Queries => format!("{}Borrowed", self.name),
+            ModCtx::ClientQueries => format!("super::{}Borrowed", self.name),
         }
     }
 }
@@ -469,31 +487,47 @@ fn resolve_table_struct<'a>(
     config: &Config,
     module_info: &ModuleInfo,
 ) -> Result<Option<&'a TableStructInfo>, Error> {
+    // Extract the base name from path like "tables::UserRow" -> "UserRow"
     let base_name = row_name
         .value
         .rsplit("::")
         .next()
         .unwrap_or(&row_name.value);
 
+    // Check if this matches a generated table struct
     if let Some(info) = table_structs.get(base_name) {
-        return Ok(Some(info));
+        // Verify that if user specified "tables::", it's correct
+        let uses_tables_prefix = row_name.value.contains("tables::");
+        let is_just_struct_name = row_name.value == base_name;
+
+        // Accept both "tables::UserRow" and "UserRow" for table structs
+        if uses_tables_prefix || is_just_struct_name {
+            return Ok(Some(info));
+        }
     }
 
+    // Check if this was explicitly declared with --:
     let declared_type = declared_types
         .iter()
         .any(|ty| ty.name.value == row_name.value);
 
+    // Determine if this looks like it should be a table struct
     let looks_like_table_struct = row_name.value.contains("tables::")
         || base_name.ends_with(&config.tables.table_struct_suffix);
 
+    // Error if user is trying to use a table struct that doesn't exist
     if looks_like_table_struct && !declared_type {
-        return Err(Error::Validation(Box::new(
-            validation::error::Error::TableStructNotGenerated {
-                src: module_info.into(),
-                name: row_name.value.clone(),
-                pos: row_name.span,
-            },
-        )));
+        // Check if the struct name itself exists in the table_structs map
+        // This provides a better error message
+        if !table_structs.contains_key(base_name) {
+            return Err(Error::Validation(Box::new(
+                validation::error::Error::TableStructNotGenerated {
+                    src: module_info.into(),
+                    name: row_name.value.clone(),
+                    pos: row_name.span,
+                },
+            )));
+        }
     }
 
     Ok(None)
@@ -606,7 +640,7 @@ fn prepare_module(
     table_structs: &HashMap<String, TableStructInfo>,
     config: &Config,
 ) -> Result<(PreparedModule, ModuleNestedSpecs), Error> {
-    validation::validate_module(&module)?;
+    validation::validate_module(&module, Some(table_structs), Some(config))?;
 
     let mut tmp_prepared_module = PreparedModule {
         info: module.info.clone(),

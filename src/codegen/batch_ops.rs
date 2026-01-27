@@ -105,7 +105,35 @@ fn gen_query_ext_trait() -> TokenStream {
             /// Construct struct from database row
             fn from_row(row: Row) -> Self;
 
+            /// Insert a single row and return it with database-generated values
+            ///
+            /// Uses `RETURNING *` to fetch the complete inserted row.
+            ///
+            /// # Example
+            /// ```rust
+            /// let inserted = restaurant.insert(&client).await?;
+            /// println!("Inserted with ID: {}", inserted.id);
+            /// ```
+            fn insert<C: GenericClient>(&self, client: &C) -> impl std::future::Future<Output = Result<Self, Error>> + Send {
+                async move {
+                    let col_names = Self::COLS.join(", ");
+                    let placeholders: Vec<String> = (1..=N).map(|i| format!("${}", i)).collect();
+                    let sql = format!(
+                        "INSERT INTO {} ({}) VALUES ({}) RETURNING *",
+                        Self::TABLE_NAME,
+                        col_names,
+                        placeholders.join(", ")
+                    );
+                    let params = self.to_params();
+                    let row = client.query_one(&sql, &params).await?;
+                    Ok(Self::from_row(row))
+                }
+            }
+
             /// Start building a batch INSERT statement
+            ///
+            /// Accepts slices, vectors, and anything convertible to InsertManyRows.
+            /// For owned iterators, use the .insert_many() extension method instead.
             ///
             /// # Example
             /// ```rust
@@ -129,8 +157,8 @@ fn gen_query_ext_trait() -> TokenStream {
             ///     .query(&client)  // Returns inserted/updated rows
             ///     .await?;
             /// ```
-            fn insert_many(rows: &[Self]) -> InsertManyQuery<'_, Self, N> {
-                InsertManyQuery::new(rows)
+            fn insert_many<'a>(rows: impl Into<InsertManyRows<'a, Self, N>>) -> InsertManyQuery<'a, Self, N> {
+                InsertManyQuery::new(rows.into())
             }
 
             /// Start building an UPDATE statement
@@ -152,23 +180,58 @@ fn gen_query_ext_trait() -> TokenStream {
     }
 }
 
-/// Generate extension trait for Vec/slices
+/// Generate extension trait for Vec/slices and wrapper for rows
 fn gen_slice_ext_trait() -> TokenStream {
     quote! {
-        /// Extension trait to enable calling .insert_many() on Vec<T> and &[T]
-        pub trait BatchInsertExt<T: QueryExt<N>, const N: usize> {
-            fn insert_many(&self) -> InsertManyQuery<'_, T, N>;
+        /// Wrapper that avoids collecting iterators until absolutely necessary
+        pub enum InsertManyRows<'a, T: QueryExt<N>, const N: usize> {
+            Slice(&'a [T]),
+            OwnedVec(Vec<T>),
         }
 
-        impl<T: QueryExt<N>, const N: usize> BatchInsertExt<T, N> for Vec<T> {
-            fn insert_many(&self) -> InsertManyQuery<'_, T, N> {
-                InsertManyQuery::new(self.as_slice())
+        impl<'a, T: QueryExt<N>, const N: usize> InsertManyRows<'a, T, N> {
+            pub fn as_slice(&'a self) -> &'a [T] {
+                match self {
+                    InsertManyRows::Slice(s) => s,
+                    InsertManyRows::OwnedVec(v) => v.as_slice(),
+                }
             }
         }
 
-        impl<T: QueryExt<N>, const N: usize> BatchInsertExt<T, N> for &[T] {
-            fn insert_many(&self) -> InsertManyQuery<'_, T, N> {
-                InsertManyQuery::new(self)
+        impl<'a, T: QueryExt<N>, const N: usize> From<&'a [T]> for InsertManyRows<'a, T, N> {
+            fn from(slice: &'a [T]) -> Self {
+                InsertManyRows::Slice(slice)
+            }
+        }
+
+        impl<'a, T: QueryExt<N>, const N: usize> From<&'a Vec<T>> for InsertManyRows<'a, T, N> {
+            fn from(vec: &'a Vec<T>) -> Self {
+                InsertManyRows::Slice(vec.as_slice())
+            }
+        }
+
+        impl<'a, T: QueryExt<N>, const N: usize> From<Vec<T>> for InsertManyRows<'a, T, N> {
+            fn from(vec: Vec<T>) -> Self {
+                InsertManyRows::OwnedVec(vec)
+            }
+        }
+
+        /// Extension trait to enable .insert_many() on Vec and slices
+        pub trait BatchInsertExt<'a, T: QueryExt<N>, const N: usize> {
+            fn insert_many(self) -> InsertManyQuery<'a, T, N>;
+        }
+
+        // For owned Vec - takes ownership
+        impl<T: QueryExt<N>, const N: usize> BatchInsertExt<'static, T, N> for Vec<T> {
+            fn insert_many(self) -> InsertManyQuery<'static, T, N> {
+                InsertManyQuery::new(InsertManyRows::OwnedVec(self))
+            }
+        }
+
+        // For slices - borrows data
+        impl<'a, T: QueryExt<N>, const N: usize> BatchInsertExt<'a, T, N> for &'a [T] {
+            fn insert_many(self) -> InsertManyQuery<'a, T, N> {
+                InsertManyQuery::new(InsertManyRows::Slice(self))
             }
         }
     }
@@ -179,7 +242,7 @@ fn gen_query_builders() -> TokenStream {
     quote! {
         /// Builder for batch INSERT statements with ON CONFLICT support
         pub struct InsertManyQuery<'a, T: QueryExt<N>, const N: usize> {
-            rows: &'a [T],
+            rows: InsertManyRows<'a, T, N>,
             excluded_cols: Option<&'a [&'a str]>,
             on_conflict: Option<ConflictClause<'a>>,
         }
@@ -195,7 +258,7 @@ fn gen_query_builders() -> TokenStream {
         }
 
         impl<'a, T: QueryExt<N>, const N: usize> InsertManyQuery<'a, T, N> {
-            pub fn new(rows: &'a [T]) -> Self {
+            pub fn new(rows: InsertManyRows<'a, T, N>) -> Self {
                 Self {
                     rows,
                     excluded_cols: None,
@@ -273,12 +336,12 @@ fn gen_query_builders() -> TokenStream {
             /// println!("Inserted {} rows", count);
             /// ```
             pub async fn exec<C: GenericClient>(&self, client: &C) -> Result<u64, Error> {
-                if self.rows.is_empty() {
+                let rows_slice = self.rows.as_slice();
+                if rows_slice.is_empty() {
                     return Ok(0);
                 }
 
-                let sql = self.build_sql();
-                let params = self.build_params();
+                let (sql, params) = self.build_sql_and_params();
                 client.execute(&sql, &params).await
             }
 
@@ -299,71 +362,22 @@ fn gen_query_builders() -> TokenStream {
             /// }
             /// ```
             pub async fn query<C: GenericClient>(&self, client: &C) -> Result<Vec<T>, Error> {
-                if self.rows.is_empty() {
+                let rows_slice = self.rows.as_slice();
+                if rows_slice.is_empty() {
                     return Ok(Vec::new());
                 }
 
-                let sql = self.build_sql() + " RETURNING *";
-                let params = self.build_params();
+                let (mut sql, params) = self.build_sql_and_params();
+                sql.push_str(" RETURNING *");
                 let rows = client.query(&sql, &params).await?;
                 Ok(rows.into_iter().map(T::from_row).collect())
             }
 
-            fn build_sql(&self) -> String {
-                let included_cols: Vec<&str> = T::COLS
-                    .iter()
-                    .copied()
-                    .filter(|col| !self.excluded_cols.map_or(false, |excluded| excluded.contains(col)))
-                    .collect();
+            /// Build SQL and params in a single pass to avoid extra iteration
+            fn build_sql_and_params<'b>(&'b self) -> (String, Vec<&'b (dyn ToSql + Sync)>) where 'a: 'b {
+                let rows_slice = self.rows.as_slice();
 
-                let col_names = included_cols.join(", ");
-                let num_cols = included_cols.len();
-
-                let mut values_clauses = Vec::new();
-                for i in 0..self.rows.len() {
-                    let mut placeholders = Vec::new();
-                    for j in 0..num_cols {
-                        placeholders.push(format!("${}", i * num_cols + j + 1));
-                    }
-                    values_clauses.push(format!("({})", placeholders.join(", ")));
-                }
-
-                let mut sql = format!(
-                    "INSERT INTO {} ({}) VALUES {}",
-                    T::TABLE_NAME,
-                    col_names,
-                    values_clauses.join(", ")
-                );
-
-                if let Some(ref conflict) = self.on_conflict {
-                    match conflict {
-                        ConflictClause::DoNothing { conflict_cols } => {
-                            sql.push_str(&format!(
-                                " ON CONFLICT ({}) DO NOTHING",
-                                conflict_cols.join(", ")
-                            ));
-                        }
-                        ConflictClause::DoUpdate {
-                            conflict_cols,
-                            update_cols,
-                        } => {
-                            let updates: Vec<String> = update_cols
-                                .iter()
-                                .map(|col| format!("{} = EXCLUDED.{}", col, col))
-                                .collect();
-                            sql.push_str(&format!(
-                                " ON CONFLICT ({}) DO UPDATE SET {}",
-                                conflict_cols.join(", "),
-                                updates.join(", ")
-                            ));
-                        }
-                    }
-                }
-
-                sql
-            }
-
-            fn build_params(&self) -> Vec<&'a (dyn ToSql + Sync)> {
+                // Determine which columns to include
                 let included_indices: Vec<usize> = T::COLS
                     .iter()
                     .enumerate()
@@ -371,14 +385,80 @@ fn gen_query_builders() -> TokenStream {
                     .map(|(i, _)| i)
                     .collect();
 
-                let mut params = Vec::new();
-                for row in self.rows {
+                let included_cols: Vec<&str> = included_indices
+                    .iter()
+                    .map(|&idx| T::COLS[idx])
+                    .collect();
+
+                let col_names = included_cols.join(", ");
+                let num_cols = included_indices.len();
+                let num_rows = rows_slice.len();
+
+                // Pre-allocate for SQL building
+                let mut sql = String::with_capacity(
+                    128 + col_names.len() + (num_rows * num_cols * 4) // rough estimate
+                );
+                sql.push_str("INSERT INTO ");
+                sql.push_str(T::TABLE_NAME);
+                sql.push_str(" (");
+                sql.push_str(&col_names);
+                sql.push_str(") VALUES ");
+
+                // Pre-allocate params with exact capacity
+                let mut params = Vec::with_capacity(num_rows * num_cols);
+
+                // Single-pass: build VALUES clauses and collect params simultaneously
+                for (row_idx, row) in rows_slice.iter().enumerate() {
+                    if row_idx > 0 {
+                        sql.push_str(", ");
+                    }
+                    sql.push('(');
+
                     let row_params = row.to_params();
-                    for &idx in &included_indices {
-                        params.push(row_params[idx]);
+                    for (col_idx, &included_idx) in included_indices.iter().enumerate() {
+                        if col_idx > 0 {
+                            sql.push_str(", ");
+                        }
+                        // Calculate placeholder number
+                        let param_num = row_idx * num_cols + col_idx + 1;
+                        sql.push('$');
+                        sql.push_str(&param_num.to_string());
+
+                        // Add param
+                        params.push(row_params[included_idx]);
+                    }
+                    sql.push(')');
+                }
+
+                // Add conflict clause if present
+                if let Some(ref conflict) = self.on_conflict {
+                    match conflict {
+                        ConflictClause::DoNothing { conflict_cols } => {
+                            sql.push_str(" ON CONFLICT (");
+                            sql.push_str(&conflict_cols.join(", "));
+                            sql.push_str(") DO NOTHING");
+                        }
+                        ConflictClause::DoUpdate {
+                            conflict_cols,
+                            update_cols,
+                        } => {
+                            sql.push_str(" ON CONFLICT (");
+                            sql.push_str(&conflict_cols.join(", "));
+                            sql.push_str(") DO UPDATE SET ");
+
+                            for (i, col) in update_cols.iter().enumerate() {
+                                if i > 0 {
+                                    sql.push_str(", ");
+                                }
+                                sql.push_str(col);
+                                sql.push_str(" = EXCLUDED.");
+                                sql.push_str(col);
+                            }
+                        }
                     }
                 }
-                params
+
+                (sql, params)
             }
         }
 

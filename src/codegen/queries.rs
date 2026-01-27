@@ -232,7 +232,14 @@ fn gen_row_query(row: &PreparedItem, ctx: &GenCtx) -> proc_macro2::TokenStream {
         ..
     } = row;
 
-    let name_ident = format_ident!("{}Query", name.to_string());
+    // Extract just the struct name from potential path (e.g., "tables::UsersRow" -> "UsersRow")
+    let row_struct_name = name
+        .to_string()
+        .rsplit("::")
+        .next()
+        .unwrap_or(&name.to_string())
+        .to_string();
+    let name_ident = format_ident!("{}Query", row_struct_name);
     let borrowed_suffix = if *is_copy { "" } else { "Borrowed" };
 
     let (client_mut, fn_async, fn_await, backend, collect, raw_type, raw_pre, raw_post) =
@@ -411,15 +418,26 @@ fn gen_query_fn(
         } = &item;
 
         let nb_params = proc_macro2::Literal::usize_unsuffixed(param_field.len());
-        let row_name_query_ident = format_ident!("{}Query", row_name.to_string());
+        // Extract just the struct name from potential path (e.g., "tables::UsersRow" -> "UsersRow")
+        let row_struct_name = row_name
+            .to_string()
+            .rsplit("::")
+            .next()
+            .unwrap_or(&row_name.to_string())
+            .to_string();
+        let row_name_query_ident = format_ident!("{}Query", row_struct_name);
 
         if *is_named {
             let path_str = &item.path(ctx);
             let path = syn::parse_str::<syn::Path>(path_str).unwrap();
-            let path_type = if *skip_definition || *is_copy {
+
+            // For extractors, always use Borrowed type unless it's Copy
+            // Table structs (skip_definition) should also use Borrowed variant
+            let path_type = if *is_copy {
                 syn::parse_str::<syn::Path>(path_str).unwrap()
             } else {
-                syn::parse_str::<syn::Path>(&format!("{path_str}Borrowed")).unwrap()
+                // Use borrowed_path() method which handles table structs correctly
+                syn::parse_str::<syn::Path>(&item.borrowed_path(ctx)).unwrap()
             };
 
             let fields_name: Vec<_> = fields
@@ -439,7 +457,8 @@ fn gen_query_fn(
                 }
             };
 
-            let mapper = if *skip_definition || *is_copy {
+            // For mappers, convert Borrowed to Owned unless it's Copy
+            let mapper = if *is_copy {
                 quote!(|it| it)
             } else {
                 quote!(|it| #path::from(it))

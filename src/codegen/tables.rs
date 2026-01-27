@@ -4,7 +4,7 @@
 //! derived from database schema introspection (not just query result types).
 
 use crate::config::Config;
-use crate::schema_introspection::{map_postgres_type_to_rust, TableSchema};
+use crate::schema_introspection::{TableSchema, map_postgres_type_to_rust};
 use heck::{ToSnakeCase, ToUpperCamelCase};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -58,8 +58,9 @@ fn gen_table_struct(
     config: &Config,
 ) -> TokenStream {
     let table_name_camel = table.name.to_upper_camel_case();
-    let struct_name = format_ident!(
-        "{}{}",
+    let struct_name = format_ident!("{}{}", table_name_camel, config.tables.table_struct_suffix);
+    let borrowed_struct_name = format_ident!(
+        "{}{}Borrowed",
         table_name_camel,
         config.tables.table_struct_suffix
     );
@@ -79,11 +80,57 @@ fn gen_table_struct(
         })
         .collect();
 
+    // Generate borrowed fields (convert String to &'a str, Vec<T> to &'a [T], etc.)
+    let borrowed_fields: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .map(|col| {
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+            let rust_type_str = map_postgres_type_to_rust(col, type_mappings);
+            let borrowed_type_str = convert_to_borrowed_type(&rust_type_str);
+            let borrowed_type: syn::Type = syn::parse_str(&borrowed_type_str)
+                .unwrap_or_else(|_| syn::parse_str("&'a str").unwrap());
+
+            quote! {
+                pub #field_name: #borrowed_type
+            }
+        })
+        .collect();
+
+    // Generate From<Borrowed> for Owned implementation
+    let field_conversions: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .map(|col| {
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+            let rust_type_str = map_postgres_type_to_rust(col, type_mappings);
+
+            // Generate appropriate conversion based on type
+            if rust_type_str == "String" {
+                quote! { #field_name: value.#field_name.to_owned() }
+            } else if rust_type_str.starts_with("Vec<") {
+                quote! { #field_name: value.#field_name.to_vec() }
+            } else if rust_type_str.starts_with("Option<String>") {
+                quote! { #field_name: value.#field_name.map(|s| s.to_owned()) }
+            } else if rust_type_str.starts_with("Option<Vec<") {
+                quote! { #field_name: value.#field_name.map(|v| v.to_vec()) }
+            } else {
+                // For Copy types (i32, i64, f64, bool, etc.) and other types, just copy
+                quote! { #field_name: value.#field_name }
+            }
+        })
+        .collect();
+
     let doc_comment = format!(
         " Complete table struct for '{}.{}' ({} columns)",
         table.schema,
         table.name,
         table.columns.len()
+    );
+
+    let borrowed_doc_comment = format!(
+        " Borrowed variant of {} for zero-copy deserialization",
+        struct_name
     );
 
     // Generate derive traits
@@ -93,12 +140,73 @@ fn gen_table_struct(
         quote! { #[derive(Debug, Clone)] }
     };
 
-    quote! {
-        #[doc = #doc_comment]
-        #derive_traits
-        pub struct #struct_name {
-            #(#fields),*
+    // Borrowed structs can't derive Serialize without explicit lifetime handling
+    let borrowed_derive_traits = quote! { #[derive(Debug, Clone)] };
+
+    // Check if any field is non-Copy (String, Vec, etc.) to determine if we need Borrowed variant
+    let has_non_copy_fields = table.columns.iter().any(|col| {
+        let rust_type = map_postgres_type_to_rust(col, type_mappings);
+        rust_type.contains("String") || rust_type.contains("Vec<")
+    });
+
+    if has_non_copy_fields {
+        quote! {
+            #[doc = #doc_comment]
+            #derive_traits
+            pub struct #struct_name {
+                #(#fields),*
+            }
+
+            #[doc = #borrowed_doc_comment]
+            #borrowed_derive_traits
+            pub struct #borrowed_struct_name<'a> {
+                #(#borrowed_fields),*
+            }
+
+            impl<'a> From<#borrowed_struct_name<'a>> for #struct_name {
+                fn from(value: #borrowed_struct_name<'a>) -> Self {
+                    Self {
+                        #(#field_conversions),*
+                    }
+                }
+            }
         }
+    } else {
+        // For all-Copy tables, only generate the main struct
+        quote! {
+            #[doc = #doc_comment]
+            #[derive(Debug, Clone, Copy)]
+            pub struct #struct_name {
+                #(#fields),*
+            }
+        }
+    }
+}
+
+/// Convert an owned Rust type to its borrowed equivalent
+fn convert_to_borrowed_type(rust_type: &str) -> String {
+    if rust_type == "String" {
+        "&'a str".to_string()
+    } else if let Some(inner) = rust_type
+        .strip_prefix("Vec<")
+        .and_then(|s| s.strip_suffix(">"))
+    {
+        format!("&'a [{}]", inner)
+    } else if let Some(inner) = rust_type.strip_prefix("Option<String") {
+        if inner == ">" {
+            "Option<&'a str>".to_string()
+        } else {
+            rust_type.to_string() // Fallback for malformed types
+        }
+    } else if let Some(rest) = rust_type.strip_prefix("Option<Vec<") {
+        if let Some(inner) = rest.strip_suffix(">>") {
+            format!("Option<&'a [{}]>", inner)
+        } else {
+            rust_type.to_string()
+        }
+    } else {
+        // For Copy types and other types, keep as-is
+        rust_type.to_string()
     }
 }
 
