@@ -17,7 +17,14 @@ fn gen_params_struct(params: &PreparedItem, ctx: &GenCtx) -> proc_macro2::TokenS
     } = params;
 
     let traits = &mut Vec::new();
-    let name_ident = format_ident!("{}", name.to_string());
+    // Extract just the struct name from potential path (e.g., "tables::SessionsRow" -> "SessionsRow")
+    let struct_name = name
+        .to_string()
+        .rsplit("::")
+        .next()
+        .unwrap_or(&name.to_string())
+        .to_string();
+    let name_ident = format_ident!("{}", struct_name);
 
     let copy_attr = if *is_copy {
         quote!(Clone, Copy,)
@@ -65,7 +72,15 @@ fn gen_row_structs(row: &PreparedItem, ctx: &GenCtx, config: &Config) -> proc_ma
         ..
     } = row;
 
-    let name_ident = format_ident!("{}", name.to_string());
+    let traits = &mut Vec::new();
+    // Extract just the struct name from potential path (e.g., "tables::SessionsRow" -> "SessionsRow")
+    let struct_name = name
+        .to_string()
+        .rsplit("::")
+        .next()
+        .unwrap_or(&name.to_string())
+        .to_string();
+    let name_ident = format_ident!("{}", struct_name);
 
     // Generate fields
     let fields_name: Vec<_> = fields
@@ -137,7 +152,7 @@ fn gen_row_structs(row: &PreparedItem, ctx: &GenCtx, config: &Config) -> proc_ma
             })
             .collect::<Vec<_>>();
 
-        let borrowed_name = format_ident!("{}Borrowed", name.to_string());
+        let borrowed_name = format_ident!("{}Borrowed", struct_name);
 
         let borrowed_fields_ty: Vec<_> = fields
             .iter()
@@ -579,10 +594,14 @@ fn gen_query_fn(
                     syn::parse_str::<syn::Type>(&prepared_row.fields[0].own_struct(ctx)).unwrap()
                 };
 
-                let name = format_ident!(
-                    "{}Query",
-                    module.rows.get_index(*idx).unwrap().1.name.to_string()
-                );
+                // Extract just the struct name from potential path (e.g., "tables::SessionsRow" -> "SessionsRow")
+                let row_struct_name = module.rows.get_index(*idx).unwrap().1.name
+                    .to_string()
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(&module.rows.get_index(*idx).unwrap().1.name.to_string())
+                    .to_string();
+                let name = format_ident!("{}Query", row_struct_name);
 
                 quote! {
                     impl<'c, 'a, 's, C: GenericClient, #(#traits_idents: #traits_bounds,)*>

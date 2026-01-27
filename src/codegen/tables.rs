@@ -109,11 +109,13 @@ fn gen_table_struct(
             if rust_type_str == "String" {
                 quote! { #field_name: value.#field_name.to_owned() }
             } else if rust_type_str.starts_with("Vec<") {
-                quote! { #field_name: value.#field_name.to_vec() }
+                // Arrays stay owned in borrowed variant, just move them
+                quote! { #field_name: value.#field_name }
             } else if rust_type_str.starts_with("Option<String>") {
                 quote! { #field_name: value.#field_name.map(|s| s.to_owned()) }
             } else if rust_type_str.starts_with("Option<Vec<") {
-                quote! { #field_name: value.#field_name.map(|v| v.to_vec()) }
+                // Optional arrays stay owned in borrowed variant, just move them
+                quote! { #field_name: value.#field_name }
             } else {
                 // For Copy types (i32, i64, f64, bool, etc.) and other types, just copy
                 quote! { #field_name: value.#field_name }
@@ -187,23 +189,21 @@ fn gen_table_struct(
 fn convert_to_borrowed_type(rust_type: &str) -> String {
     if rust_type == "String" {
         "&'a str".to_string()
-    } else if let Some(inner) = rust_type
+    } else if let Some(_inner) = rust_type
         .strip_prefix("Vec<")
         .and_then(|s| s.strip_suffix(">"))
     {
-        format!("&'a [{}]", inner)
+        // Arrays cannot be borrowed from postgres - keep as Vec<T>
+        rust_type.to_string()
     } else if let Some(inner) = rust_type.strip_prefix("Option<String") {
         if inner == ">" {
             "Option<&'a str>".to_string()
         } else {
             rust_type.to_string() // Fallback for malformed types
         }
-    } else if let Some(rest) = rust_type.strip_prefix("Option<Vec<") {
-        if let Some(inner) = rest.strip_suffix(">>") {
-            format!("Option<&'a [{}]>", inner)
-        } else {
-            rust_type.to_string()
-        }
+    } else if rust_type.starts_with("Option<Vec<") {
+        // Optional arrays also cannot be borrowed - keep as Option<Vec<T>>
+        rust_type.to_string()
     } else {
         // For Copy types and other types, keep as-is
         rust_type.to_string()
