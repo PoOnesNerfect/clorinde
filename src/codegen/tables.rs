@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn test_gen_table_struct() {
         let table = TableSchema {
-            name: "restaurants".to_string(),
+            name: "places".to_string(),
             schema: "public".to_string(),
             columns: vec![
                 ColumnDef {
@@ -226,7 +226,7 @@ mod tests {
                     data_type: "bigint".to_string(),
                     udt_name: "int8".to_string(),
                     is_nullable: false,
-                    column_default: Some("nextval('restaurants_id_seq')".to_string()),
+                    column_default: Some("nextval('places_id_seq')".to_string()),
                     ordinal_position: 1,
                 },
                 ColumnDef {
@@ -257,7 +257,7 @@ mod tests {
         let tokens = gen_table_struct(&table, &type_mappings, &config);
         let code = tokens.to_string();
 
-        assert!(code.contains("pub struct RestaurantTable"));
+        assert!(code.contains("pub struct PlaceTable"));
         assert!(code.contains("pub id: i64"));
         assert!(code.contains("pub google_id: String"));
         assert!(code.contains("pub rating: Option < f64 >"));

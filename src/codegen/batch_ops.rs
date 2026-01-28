@@ -93,7 +93,7 @@ fn gen_query_ext_trait() -> TokenStream {
         ///
         /// Generic parameter N is the number of columns in the table.
         pub trait QueryExt<const N: usize>: Sized + Sync {
-            /// SQL table name (e.g., "public.restaurants")
+            /// SQL table name (e.g., "public.places")
             const TABLE_NAME: &'static str;
 
             /// All column names in ordinal order
@@ -111,7 +111,7 @@ fn gen_query_ext_trait() -> TokenStream {
             ///
             /// # Example
             /// ```rust
-            /// let inserted = restaurant.insert(&client).await?;
+            /// let inserted = place.insert(&client).await?;
             /// println!("Inserted with ID: {}", inserted.id);
             /// ```
             fn insert<C: GenericClient>(&self, client: &C) -> impl std::future::Future<Output = Result<Self, Error>> + Send {
@@ -137,18 +137,18 @@ fn gen_query_ext_trait() -> TokenStream {
             ///
             /// # Example
             /// ```rust
-            /// use restaurants_col::*;
+            /// use places_col::*;
             ///
             /// let rows = vec![restaurant1, restaurant2];
             ///
             /// // Insert with auto-generated columns excluded
-            /// RestaurantsRow::insert_many(&rows)
+            /// PlacesRow::insert_many(&rows)
             ///     .excluding_cols(&[ID, CREATED_AT_MS, UPDATED_AT_MS])
             ///     .exec(&client)
             ///     .await?;
             ///
             /// // Upsert on conflict
-            /// RestaurantsRow::insert_many(&rows)
+            /// PlacesRow::insert_many(&rows)
             ///     .excluding_cols(&[ID, CREATED_AT_MS])
             ///     .on_conflict_do_update(
             ///         &[GOOGLE_ID],  // conflict columns
@@ -165,9 +165,9 @@ fn gen_query_ext_trait() -> TokenStream {
             ///
             /// # Example
             /// ```rust
-            /// use restaurants_col::*;
+            /// use places_col::*;
             ///
-            /// restaurant
+            /// place
             ///     .update_cols(&[RATING, USER_RATING_COUNT])
             ///     .where_cols(&[GOOGLE_ID])
             ///     .exec(&client)
@@ -270,7 +270,7 @@ fn gen_query_builders() -> TokenStream {
             ///
             /// # Example
             /// ```rust
-            /// use restaurants_col::*;
+            /// use places_col::*;
             /// rows.insert_many()
             ///     .excluding_cols(&[ID, CREATED_AT_MS, UPDATED_AT_MS])
             ///     .exec(&client)
@@ -285,7 +285,7 @@ fn gen_query_builders() -> TokenStream {
             ///
             /// # Example
             /// ```rust
-            /// use restaurants_col::*;
+            /// use places_col::*;
             /// rows.insert_many()
             ///     .on_conflict_do_nothing(&[GOOGLE_ID])
             ///     .exec(&client)
@@ -302,14 +302,14 @@ fn gen_query_builders() -> TokenStream {
             ///
             /// # Example
             /// ```rust
-            /// use restaurants_col::*;
+            /// use places_col::*;
             /// rows.insert_many()
             ///     .excluding_cols(&[ID, CREATED_AT_MS])
             ///     .on_conflict_do_update(
             ///         &[GOOGLE_ID],  // conflict columns (unique constraint)
             ///         &[DISPLAY_NAME, RATING, UPDATED_AT_MS],  // columns to update
             ///     )
-            ///     .query(&client)  // Returns Vec<RestaurantsRow> with updated data
+            ///     .query(&client)  // Returns Vec<PlacesRow> with updated data
             ///     .await?;
             /// ```
             pub fn on_conflict_do_update(
@@ -328,7 +328,7 @@ fn gen_query_builders() -> TokenStream {
             ///
             /// # Example
             /// ```rust
-            /// use restaurants_col::*;
+            /// use places_col::*;
             /// let count = rows.insert_many()
             ///     .excluding_cols(&[ID])
             ///     .exec(&client)
@@ -351,14 +351,14 @@ fn gen_query_builders() -> TokenStream {
             ///
             /// # Example
             /// ```rust
-            /// use restaurants_col::*;
+            /// use places_col::*;
             /// let inserted = rows.insert_many()
             ///     .excluding_cols(&[ID])
             ///     .query(&client)
             ///     .await?;
             ///
-            /// for restaurant in inserted {
-            ///     println!("Inserted with ID: {}", restaurant.id);
+            /// for place in inserted {
+            ///     println!("Inserted with ID: {}", place.id);
             /// }
             /// ```
             pub async fn query<C: GenericClient>(&self, client: &C) -> Result<Vec<T>, Error> {
@@ -482,8 +482,8 @@ fn gen_query_builders() -> TokenStream {
             ///
             /// # Example
             /// ```rust
-            /// use restaurants_col::*;
-            /// restaurant
+            /// use places_col::*;
+            /// place
             ///     .update_cols(&[RATING, USER_RATING_COUNT])
             ///     .where_cols(&[GOOGLE_ID])
             ///     .exec(&client)
@@ -498,8 +498,8 @@ fn gen_query_builders() -> TokenStream {
             ///
             /// # Example
             /// ```rust
-            /// use restaurants_col::*;
-            /// let count = restaurant
+            /// use places_col::*;
+            /// let count = place
             ///     .update_cols(&[RATING])
             ///     .where_cols(&[ID])
             ///     .exec(&client)

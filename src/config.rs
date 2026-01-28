@@ -264,7 +264,7 @@ pub struct Tables {
     #[serde(rename = "exclude-tables", default)]
     pub exclude_tables: Vec<String>,
 
-    /// Suffix for generated table structs (e.g., "Table" -> RestaurantTable)
+    /// Suffix for generated table structs (e.g., "Table" -> PlaceTable)
     #[serde(rename = "table-struct-suffix", default = "default_table_suffix")]
     pub table_struct_suffix: String,
 }

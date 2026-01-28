@@ -11,7 +11,7 @@ use tokio_postgres::Client;
 /// Complete definition of a database table
 #[derive(Debug, Clone)]
 pub struct TableSchema {
-    /// Table name (e.g., "restaurants")
+    /// Table name (e.g., "places")
     pub name: String,
     /// Schema name (e.g., "public")
     pub schema: String,
