@@ -139,7 +139,7 @@ fn gen_query_ext_trait() -> TokenStream {
             /// ```rust
             /// use places_col::*;
             ///
-            /// let rows = vec![restaurant1, restaurant2];
+            /// let rows = vec![place1, place2];
             ///
             /// // Insert with auto-generated columns excluded
             /// PlacesRow::insert_many(&rows)
