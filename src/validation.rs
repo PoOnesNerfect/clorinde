@@ -465,7 +465,11 @@ pub mod error {
             pos: SourceSpan,
         },
         #[error("query `{query}` does not match table struct `{table}` columns")]
-        #[diagnostic(help("expected columns: {expected}; got: {actual}"))]
+        #[diagnostic(help(
+            "{:<20}{expected}\n{:<20}{actual}",
+            "expected columns:",
+            "actual columns:"
+        ))]
         TableStructShapeMismatch {
             #[source_code]
             src: NamedSource<Arc<String>>,
