@@ -145,13 +145,29 @@ fn gen_table_struct(
     // Borrowed structs can't derive Serialize without explicit lifetime handling
     let borrowed_derive_traits = quote! { #[derive(Debug, Clone)] };
 
-    // Check if any field is non-Copy (String, Vec, etc.) to determine if we need Borrowed variant
-    let has_non_copy_fields = table.columns.iter().any(|col| {
+    // Check if any field actually uses the 'a lifetime (String -> &'a str, Option<String> -> Option<&'a str>)
+    let has_borrowed_fields = table.columns.iter().any(|col| {
         let rust_type = map_postgres_type_to_rust(col, type_mappings);
-        rust_type.contains("String") || rust_type.contains("Vec<")
+        rust_type == "String" || rust_type == "Option<String>"
     });
 
-    if has_non_copy_fields {
+    // Check if all fields are Copy types
+    let all_copy_fields = table.columns.iter().all(|col| {
+        let rust_type = map_postgres_type_to_rust(col, type_mappings);
+        !rust_type.contains("String") && !rust_type.contains("Vec<") && !rust_type.contains("json")
+    });
+
+    if all_copy_fields {
+        // For all-Copy tables, generate Copy struct only (no borrowed variant needed)
+        quote! {
+            #[doc = #doc_comment]
+            #[derive(Debug, Clone, Copy)]
+            pub struct #struct_name {
+                #(#fields),*
+            }
+        }
+    } else if has_borrowed_fields {
+        // Generate borrowed struct WITH lifetime parameter (has actual String fields to borrow)
         quote! {
             #[doc = #doc_comment]
             #derive_traits
@@ -174,12 +190,27 @@ fn gen_table_struct(
             }
         }
     } else {
-        // For all-Copy tables, only generate the main struct
+        // Generate borrowed struct WITHOUT lifetime parameter (has Vec/Json but no String fields)
+        // Still need borrowed variant for query code compatibility, but no lifetime needed
         quote! {
             #[doc = #doc_comment]
-            #[derive(Debug, Clone, Copy)]
+            #derive_traits
             pub struct #struct_name {
                 #(#fields),*
+            }
+
+            #[doc = #borrowed_doc_comment]
+            #borrowed_derive_traits
+            pub struct #borrowed_struct_name {
+                #(#borrowed_fields),*
+            }
+
+            impl From<#borrowed_struct_name> for #struct_name {
+                fn from(value: #borrowed_struct_name) -> Self {
+                    Self {
+                        #(#field_conversions),*
+                    }
+                }
             }
         }
     }
