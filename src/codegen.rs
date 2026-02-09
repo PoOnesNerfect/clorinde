@@ -141,21 +141,50 @@ pub(crate) fn gen(
     table_schemas: Option<Vec<crate::schema_introspection::TableSchema>>,
 ) -> Vfs {
     let mut vfs = Vfs::empty();
-    let cargo = cargo::gen_cargo_file(&preparation.dependency_analysis, config);
+    // Merge dependency analysis from queries with table schema-derived types
+    let mut dependency_analysis = preparation.dependency_analysis.clone();
+
+    if let Some(ref schemas) = table_schemas {
+        for table in schemas.iter() {
+            for col in table.columns.iter() {
+                match col.data_type.as_str() {
+                    "timestamp" | "timestamp without time zone" |
+                    "timestamp with time zone" | "timestamptz" |
+                    "date" | "time" | "time without time zone" => {
+                        dependency_analysis.chrono = true;
+                    }
+                    "json" | "jsonb" => dependency_analysis.json = true,
+                    "uuid" => dependency_analysis.uuid = true,
+                    "numeric" | "decimal" => dependency_analysis.decimal = true,
+                    _ => {
+                        // Also check udt_name for array/udt markers
+                        match col.udt_name.as_str() {
+                            "_timestamp" | "_timestamptz" | "_date" | "_time" => {
+                                dependency_analysis.chrono = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let cargo = cargo::gen_cargo_file(&dependency_analysis, config);
     vfs.add_string("Cargo.toml", cargo);
 
     // Generate lib.rs with appropriate module declarations
     let lib_contents = if table_schemas.is_some() {
-        client::gen_lib_with_tables(&preparation.dependency_analysis, config)
+        client::gen_lib_with_tables(&dependency_analysis, config)
     } else {
-        client::gen_lib(&preparation.dependency_analysis, config)
+        client::gen_lib(&dependency_analysis, config)
     };
     vfs.add("src/lib.rs", lib_contents);
 
     let types = gen_type_modules(&preparation.types, config);
     vfs.add("src/types.rs", types);
     queries::gen_queries(&mut vfs, &preparation, config);
-    client::gen_clients(&mut vfs, &preparation.dependency_analysis, config);
+    client::gen_clients(&mut vfs, &dependency_analysis, config);
 
     // Generate tables and batch_ops modules if schema introspection was performed
     if let Some(ref schemas) = table_schemas {
