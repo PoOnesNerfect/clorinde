@@ -6,7 +6,7 @@
 //! - QueryExt implementations for each table struct
 
 use crate::config::Config;
-use crate::schema_introspection::TableSchema;
+use crate::schema_introspection::{ColumnDef, TableSchema, map_postgres_type_to_rust};
 use heck::{ToSnakeCase, ToUpperCamelCase};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -43,12 +43,17 @@ pub fn gen_batch_ops_module(tables: &[TableSchema], config: &Config) -> TokenStr
         .iter()
         .map(|table| gen_column_enum(table, config))
         .collect();
-    let impls: Vec<TokenStream> = tables
+
+    // Separate batch structs from trait implementations
+    let batch_structs: Vec<TokenStream> = tables
         .iter()
-        .map(|table| gen_query_ext_impl(table, &type_mappings, config))
+        .map(|table| gen_batch_struct(table, &type_mappings, config))
         .collect();
 
-    let slice_ext = gen_slice_ext_trait();
+    let trait_impls: Vec<TokenStream> = tables
+        .iter()
+        .map(|table| gen_query_ext_impl_only(table, &type_mappings, config))
+        .collect();
 
     quote! {
         //! Auto-generated batch operations infrastructure
@@ -62,6 +67,7 @@ pub fn gen_batch_ops_module(tables: &[TableSchema], config: &Config) -> TokenStr
         use tokio_postgres::{Row, types::ToSql, Error};
         use crate::client::async_::GenericClient;
         use crate::tables::*;
+        use itertools::Itertools;
 
         #(#col_enums)*
 
@@ -74,15 +80,16 @@ pub fn gen_batch_ops_module(tables: &[TableSchema], config: &Config) -> TokenStr
 
             #trait_def
 
-            #slice_ext
-
             #builders
 
-            #(#impls)*
+            #(#trait_impls)*
         }
 
-        // Re-export the traits for easy access
-        pub use __private::{QueryExt, BatchInsertExt};
+        // Re-export the trait for easy access
+        pub use __private::QueryExt;
+
+        // Batch operation structs are public
+        #(#batch_structs)*
     }
 }
 
@@ -130,37 +137,6 @@ fn gen_query_ext_trait() -> TokenStream {
                 }
             }
 
-            /// Start building a batch INSERT statement
-            ///
-            /// Accepts slices, vectors, and anything convertible to InsertManyRows.
-            /// For owned iterators, use the .insert_many() extension method instead.
-            ///
-            /// # Example
-            /// ```rust
-            /// use places_col::*;
-            ///
-            /// let rows = vec![place1, place2];
-            ///
-            /// // Insert with auto-generated columns excluded
-            /// PlacesRow::insert_many(&rows)
-            ///     .excluding_cols(&[ID, CREATED_AT_MS, UPDATED_AT_MS])
-            ///     .exec(&client)
-            ///     .await?;
-            ///
-            /// // Upsert on conflict
-            /// PlacesRow::insert_many(&rows)
-            ///     .excluding_cols(&[ID, CREATED_AT_MS])
-            ///     .on_conflict_do_update(
-            ///         &[GOOGLE_ID],  // conflict columns
-            ///         &[DISPLAY_NAME, RATING],  // columns to update
-            ///     )
-            ///     .query(&client)  // Returns inserted/updated rows
-            ///     .await?;
-            /// ```
-            fn insert_many<'a>(rows: impl Into<InsertManyRows<'a, Self, N>>) -> InsertManyQuery<'a, Self, N> {
-                InsertManyQuery::new(rows.into())
-            }
-
             /// Start building an UPDATE statement
             ///
             /// # Example
@@ -181,287 +157,10 @@ fn gen_query_ext_trait() -> TokenStream {
 }
 
 /// Generate extension trait for Vec/slices and wrapper for rows
-fn gen_slice_ext_trait() -> TokenStream {
-    quote! {
-        /// Wrapper that avoids collecting iterators until absolutely necessary
-        pub enum InsertManyRows<'a, T: QueryExt<N>, const N: usize> {
-            Slice(&'a [T]),
-            OwnedVec(Vec<T>),
-        }
-
-        impl<'a, T: QueryExt<N>, const N: usize> InsertManyRows<'a, T, N> {
-            pub fn as_slice(&'a self) -> &'a [T] {
-                match self {
-                    InsertManyRows::Slice(s) => s,
-                    InsertManyRows::OwnedVec(v) => v.as_slice(),
-                }
-            }
-        }
-
-        impl<'a, T: QueryExt<N>, const N: usize> From<&'a [T]> for InsertManyRows<'a, T, N> {
-            fn from(slice: &'a [T]) -> Self {
-                InsertManyRows::Slice(slice)
-            }
-        }
-
-        impl<'a, T: QueryExt<N>, const N: usize> From<&'a Vec<T>> for InsertManyRows<'a, T, N> {
-            fn from(vec: &'a Vec<T>) -> Self {
-                InsertManyRows::Slice(vec.as_slice())
-            }
-        }
-
-        impl<'a, T: QueryExt<N>, const N: usize> From<Vec<T>> for InsertManyRows<'a, T, N> {
-            fn from(vec: Vec<T>) -> Self {
-                InsertManyRows::OwnedVec(vec)
-            }
-        }
-
-        /// Extension trait to enable .insert_many() on Vec and slices
-        pub trait BatchInsertExt<'a, T: QueryExt<N>, const N: usize> {
-            fn insert_many(self) -> InsertManyQuery<'a, T, N>;
-        }
-
-        // For owned Vec - takes ownership
-        impl<T: QueryExt<N>, const N: usize> BatchInsertExt<'static, T, N> for Vec<T> {
-            fn insert_many(self) -> InsertManyQuery<'static, T, N> {
-                InsertManyQuery::new(InsertManyRows::OwnedVec(self))
-            }
-        }
-
-        // For slices - borrows data
-        impl<'a, T: QueryExt<N>, const N: usize> BatchInsertExt<'a, T, N> for &'a [T] {
-            fn insert_many(self) -> InsertManyQuery<'a, T, N> {
-                InsertManyQuery::new(InsertManyRows::Slice(self))
-            }
-        }
-    }
-}
 
 /// Generate query builder structs and implementations
 fn gen_query_builders() -> TokenStream {
     quote! {
-        /// Builder for batch INSERT statements with ON CONFLICT support
-        pub struct InsertManyQuery<'a, T: QueryExt<N>, const N: usize> {
-            rows: InsertManyRows<'a, T, N>,
-            excluded_cols: Option<&'a [&'a str]>,
-            on_conflict: Option<ConflictClause<'a>>,
-        }
-
-        enum ConflictClause<'a> {
-            DoNothing {
-                conflict_cols: &'a [&'a str],
-            },
-            DoUpdate {
-                conflict_cols: &'a [&'a str],
-                update_cols: &'a [&'a str],
-            },
-        }
-
-        impl<'a, T: QueryExt<N>, const N: usize> InsertManyQuery<'a, T, N> {
-            pub fn new(rows: InsertManyRows<'a, T, N>) -> Self {
-                Self {
-                    rows,
-                    excluded_cols: None,
-                    on_conflict: None,
-                }
-            }
-
-            /// Exclude columns from the INSERT (e.g., auto-generated columns)
-            ///
-            /// # Example
-            /// ```rust
-            /// use places_col::*;
-            /// rows.insert_many()
-            ///     .excluding_cols(&[ID, CREATED_AT_MS, UPDATED_AT_MS])
-            ///     .exec(&client)
-            ///     .await?;
-            /// ```
-            pub fn excluding_cols(mut self, cols: &'a [&'a str]) -> Self {
-                self.excluded_cols = Some(cols);
-                self
-            }
-
-            /// Add ON CONFLICT DO NOTHING clause
-            ///
-            /// # Example
-            /// ```rust
-            /// use places_col::*;
-            /// rows.insert_many()
-            ///     .on_conflict_do_nothing(&[GOOGLE_ID])
-            ///     .exec(&client)
-            ///     .await?;
-            /// ```
-            pub fn on_conflict_do_nothing(mut self, conflict_cols: &'a [&'a str]) -> Self {
-                self.on_conflict = Some(ConflictClause::DoNothing {
-                    conflict_cols
-                });
-                self
-            }
-
-            /// Add ON CONFLICT DO UPDATE clause
-            ///
-            /// # Example
-            /// ```rust
-            /// use places_col::*;
-            /// rows.insert_many()
-            ///     .excluding_cols(&[ID, CREATED_AT_MS])
-            ///     .on_conflict_do_update(
-            ///         &[GOOGLE_ID],  // conflict columns (unique constraint)
-            ///         &[DISPLAY_NAME, RATING, UPDATED_AT_MS],  // columns to update
-            ///     )
-            ///     .query(&client)  // Returns Vec<PlacesRow> with updated data
-            ///     .await?;
-            /// ```
-            pub fn on_conflict_do_update(
-                mut self,
-                conflict_cols: &'a [&'a str],
-                update_cols: &'a [&'a str],
-            ) -> Self {
-                self.on_conflict = Some(ConflictClause::DoUpdate {
-                    conflict_cols,
-                    update_cols,
-                });
-                self
-            }
-
-            /// Execute the INSERT statement and return the number of rows affected
-            ///
-            /// # Example
-            /// ```rust
-            /// use places_col::*;
-            /// let count = rows.insert_many()
-            ///     .excluding_cols(&[ID])
-            ///     .exec(&client)
-            ///     .await?;
-            /// println!("Inserted {} rows", count);
-            /// ```
-            pub async fn exec<C: GenericClient>(&self, client: &C) -> Result<u64, Error> {
-                let rows_slice = self.rows.as_slice();
-                if rows_slice.is_empty() {
-                    return Ok(0);
-                }
-
-                let (sql, params) = self.build_sql_and_params();
-                client.execute(&sql, &params).await
-            }
-
-            /// Execute the INSERT statement and return inserted/updated rows
-            ///
-            /// Uses `RETURNING *` to fetch all inserted or updated data.
-            ///
-            /// # Example
-            /// ```rust
-            /// use places_col::*;
-            /// let inserted = rows.insert_many()
-            ///     .excluding_cols(&[ID])
-            ///     .query(&client)
-            ///     .await?;
-            ///
-            /// for place in inserted {
-            ///     println!("Inserted with ID: {}", place.id);
-            /// }
-            /// ```
-            pub async fn query<C: GenericClient>(&self, client: &C) -> Result<Vec<T>, Error> {
-                let rows_slice = self.rows.as_slice();
-                if rows_slice.is_empty() {
-                    return Ok(Vec::new());
-                }
-
-                let (mut sql, params) = self.build_sql_and_params();
-                sql.push_str(" RETURNING *");
-                let rows = client.query(&sql, &params).await?;
-                Ok(rows.into_iter().map(T::from_row).collect())
-            }
-
-            /// Build SQL and params in a single pass to avoid extra iteration
-            fn build_sql_and_params<'b>(&'b self) -> (String, Vec<&'b (dyn ToSql + Sync)>) where 'a: 'b {
-                let rows_slice = self.rows.as_slice();
-
-                // Determine which columns to include
-                let included_indices: Vec<usize> = T::COLS
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, col)| !self.excluded_cols.map_or(false, |excluded| excluded.contains(col)))
-                    .map(|(i, _)| i)
-                    .collect();
-
-                let included_cols: Vec<&str> = included_indices
-                    .iter()
-                    .map(|&idx| T::COLS[idx])
-                    .collect();
-
-                let col_names = included_cols.join(", ");
-                let num_cols = included_indices.len();
-                let num_rows = rows_slice.len();
-
-                // Pre-allocate for SQL building
-                let mut sql = String::with_capacity(
-                    128 + col_names.len() + (num_rows * num_cols * 4) // rough estimate
-                );
-                sql.push_str("INSERT INTO ");
-                sql.push_str(T::TABLE_NAME);
-                sql.push_str(" (");
-                sql.push_str(&col_names);
-                sql.push_str(") VALUES ");
-
-                // Pre-allocate params with exact capacity
-                let mut params = Vec::with_capacity(num_rows * num_cols);
-
-                // Single-pass: build VALUES clauses and collect params simultaneously
-                for (row_idx, row) in rows_slice.iter().enumerate() {
-                    if row_idx > 0 {
-                        sql.push_str(", ");
-                    }
-                    sql.push('(');
-
-                    let row_params = row.to_params();
-                    for (col_idx, &included_idx) in included_indices.iter().enumerate() {
-                        if col_idx > 0 {
-                            sql.push_str(", ");
-                        }
-                        // Calculate placeholder number
-                        let param_num = row_idx * num_cols + col_idx + 1;
-                        sql.push('$');
-                        sql.push_str(&param_num.to_string());
-
-                        // Add param
-                        params.push(row_params[included_idx]);
-                    }
-                    sql.push(')');
-                }
-
-                // Add conflict clause if present
-                if let Some(ref conflict) = self.on_conflict {
-                    match conflict {
-                        ConflictClause::DoNothing { conflict_cols } => {
-                            sql.push_str(" ON CONFLICT (");
-                            sql.push_str(&conflict_cols.join(", "));
-                            sql.push_str(") DO NOTHING");
-                        }
-                        ConflictClause::DoUpdate {
-                            conflict_cols,
-                            update_cols,
-                        } => {
-                            sql.push_str(" ON CONFLICT (");
-                            sql.push_str(&conflict_cols.join(", "));
-                            sql.push_str(") DO UPDATE SET ");
-
-                            for (i, col) in update_cols.iter().enumerate() {
-                                if i > 0 {
-                                    sql.push_str(", ");
-                                }
-                                sql.push_str(col);
-                                sql.push_str(" = EXCLUDED.");
-                                sql.push_str(col);
-                            }
-                        }
-                    }
-                }
-
-                (sql, params)
-            }
-        }
-
         /// Builder for UPDATE statements
         pub struct UpdateColsQuery<'a, T: QueryExt<N>, const N: usize> {
             row: &'a T,
@@ -563,6 +262,19 @@ fn gen_query_builders() -> TokenStream {
     }
 }
 
+fn map_column_to_pg_type(col: &ColumnDef) -> String {
+    if col.data_type == "ARRAY" {
+        let elem = col.udt_name.strip_prefix('_').unwrap_or(&col.udt_name);
+        return format!("{}[]", elem);
+    }
+
+    if col.data_type == "USER-DEFINED" {
+        return col.udt_name.clone();
+    }
+
+    col.udt_name.clone()
+}
+
 /// Generate column constants module for a table
 fn gen_column_enum(table: &TableSchema, _config: &Config) -> TokenStream {
     let table_name_snake = table.name.to_snake_case();
@@ -598,11 +310,697 @@ fn gen_column_enum(table: &TableSchema, _config: &Config) -> TokenStream {
 /// Generate QueryExt implementation for a single table
 fn gen_query_ext_impl(
     table: &TableSchema,
-    _type_mappings: &HashMap<String, String>,
+    type_mappings: &HashMap<String, String>,
     config: &Config,
 ) -> TokenStream {
     let table_name_camel = table.name.to_upper_camel_case();
     let struct_name = format_ident!("{}{}", table_name_camel, config.tables.table_struct_suffix);
+    let batch_struct_name = format_ident!("{}Batch", table_name_camel);
+
+    let field_count = table.columns.len();
+    let full_table_name = format!("{}.{}", table.schema, table.name);
+
+    // Generate COLS array
+    let col_names: Vec<String> = table.columns.iter().map(|col| col.name.clone()).collect();
+    // Generate to_params method
+    let param_refs: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .map(|col| {
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+            quote! { &self.#field_name }
+        })
+        .collect();
+
+    // Generate from_row method
+    let field_extractions: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(idx, col)| {
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+            let index = proc_macro2::Literal::usize_unsuffixed(idx);
+            quote! {
+                #field_name: row.get(#index)
+            }
+        })
+        .collect();
+
+    let batch_fields: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .map(|col| {
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+            let rust_type_str = map_postgres_type_to_rust(col, type_mappings);
+            let vec_type_str = format!("Vec<{}>", rust_type_str);
+            let vec_type: syn::Type = syn::parse_str(&vec_type_str)
+                .unwrap_or_else(|_| syn::parse_str("Vec<String>").unwrap());
+
+            quote! { pub #field_name: #vec_type }
+        })
+        .collect();
+
+    let batch_init_fields: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .map(|col| {
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+            quote! { #field_name: Vec::new() }
+        })
+        .collect();
+    let batch_init_fields_with_capacity: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .map(|col| {
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+            quote! { #field_name: Vec::with_capacity(capacity) }
+        })
+        .collect();
+
+    // Generate individual named parameters for push method
+    let push_params: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(idx, col)| {
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+            let rust_type_str = map_postgres_type_to_rust(col, type_mappings);
+            let rust_type: syn::Type = syn::parse_str(&rust_type_str)
+                .unwrap_or_else(|_| syn::parse_str("String").unwrap());
+            let generic_name = format_ident!("T{}", idx);
+
+            // Non-default/non-identity columns: regular type
+            // Default/identity columns: impl Into<Option<T>>
+            if col.column_default.is_none() && !col.is_identity {
+                quote! { #field_name: #rust_type }
+            } else {
+                quote! { #field_name: #generic_name }
+            }
+        })
+        .collect();
+
+    // Generate generic bounds for nullable, default, or identity columns
+    let push_generics: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, col)| {
+            if col.column_default.is_some() || col.is_identity {
+                let rust_type_str = map_postgres_type_to_rust(col, type_mappings);
+                let rust_type: syn::Type = syn::parse_str(&rust_type_str)
+                    .unwrap_or_else(|_| syn::parse_str("String").unwrap());
+                let generic_name = format_ident!("T{}", idx);
+                Some(quote! { #generic_name: Into<Option<#rust_type>> })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let push_field_pushes: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .map(|col| {
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+
+            if col.column_default.is_none() && !col.is_identity {
+                // Non-default columns: push directly
+                quote! {
+                    self.#field_name.push(#field_name);
+                }
+            } else {
+                // Default/identity columns: use Into<Option<T>>
+                quote! {
+                    if let Some(val) = #field_name.into() {
+                        self.#field_name.push(val);
+                    }
+                }
+            }
+        })
+        .collect();
+
+    let first_field_name = table
+        .columns
+        .first()
+        .map(|col| format_ident!("{}", col.name.to_snake_case()))
+        .expect("table must have at least one column");
+
+    // Build complete tuples (col_name, col_type, param) as TokenStreams for filtering case
+    let col_name_type_param_tuples: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .map(|col| {
+            let col_name = &col.name;
+            let col_pg_type = map_column_to_pg_type(col);
+            let col_type = format!("{}[]", col_pg_type);
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+            quote! {
+                (#col_name, #col_type, &self.#field_name as &(dyn ToSql + Sync))
+            }
+        })
+        .collect();
+
+    // Generate match arms to get Vec length by index
+    let idx_to_len_arms: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(idx, col)| {
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+            let idx_lit = proc_macro2::Literal::usize_unsuffixed(idx);
+            quote! {
+                #idx_lit => self.#field_name.len(),
+            }
+        })
+        .collect();
+
+    let struct_doc = format!(
+        " Batch insert builder for {} using UNNEST\n\n \
+         Usage: Required columns accept values directly. Optional columns (with DEFAULT or IDENTITY) \
+         accept impl Into<Option<T>>, so you can pass the value, Some(value), or None.\n\n \
+         Example:\n \
+         ```rust\n \
+         let mut batch = {}Batch::new();\n \
+         // Required columns: pass values directly\n \
+         // Optional columns: pass value, Some(value), or None\n \
+         batch.push(\"name\", \"email\", None, None);\n \
+         batch.push(\"name2\", \"email2\", Some(100), Some(4.5));\n \
+         batch.exec(&client).await?;\n \
+         ```\n\n \
+         Validation: All non-empty column Vecs must have the same length. \
+         Panics if lengths don't match.",
+        struct_name, struct_name
+    );
+
+    quote! {
+        #[doc = #struct_doc]
+        pub struct #batch_struct_name {
+            #(#batch_fields,)*
+        }
+
+        impl #batch_struct_name {
+            pub fn new() -> Self {
+                Self {
+                    #(#batch_init_fields,)*
+                }
+            }
+
+            pub fn with_capacity(capacity: usize) -> Self {
+                Self {
+                    #(#batch_init_fields_with_capacity,)*
+                }
+            }
+
+            /// Add values to the batch
+            ///
+            /// Required columns (without defaults) accept values directly.
+            /// Optional columns (with DEFAULT or IDENTITY) accept `impl Into<Option<T>>`,
+            /// so you can pass the value directly, `Some(value)`, or `None`.
+            ///
+            /// # Example
+            /// ```rust
+            /// // Push with all required values
+            /// batch.push("google_id", location, h3_cell, None, None);
+            ///
+            /// // Or provide optional values
+            /// batch.push("google_id", location, h3_cell, Some(4.5), Some(100));
+            /// ```
+            pub fn push<#(#push_generics),*>(
+                &mut self,
+                #(#push_params),*
+            ) -> &mut Self {
+                #(#push_field_pushes)*
+                self
+            }
+
+            pub fn is_empty(&self) -> bool {
+                self.#first_field_name.is_empty()
+            }
+
+            pub fn len(&self) -> usize {
+                self.#first_field_name.len()
+            }
+
+            pub async fn exec<C: GenericClient>(&self, client: &C) -> Result<u64, Error> {
+                if self.is_empty() {
+                    return Ok(0);
+                }
+
+                // Build tuple array for all columns
+                let all_cols: [(&str, &str, &(dyn ToSql + Sync)); #field_count] = [
+                    #(#col_name_type_param_tuples),*
+                ];
+
+                // Filter to non-empty columns and validate all have same length
+                let non_empty: Vec<_> = all_cols
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(idx, (col_name, col_type, param))| {
+                        let len = match idx {
+                            #(#idx_to_len_arms)*
+                            _ => 0,
+                        };
+                        if len > 0 {
+                            Some((col_name, col_type, param, len))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if non_empty.is_empty() {
+                    return Ok(0);
+                }
+
+                // Validate all non-empty columns have the same length
+                let first_len = non_empty[0].3;
+                for (col_name, _, _, len) in &non_empty {
+                    if *len != first_len {
+                        panic!(
+                            "Batch insert validation failed: Column '{}' has {} values, but expected {} (first non-empty column length)",
+                            col_name, len, first_len
+                        );
+                    }
+                }
+
+                let col_names_joined = non_empty.iter().map(|(name, _, _, _)| *name).join(", ");
+                let params: Vec<_> = non_empty.iter().map(|(_, _, param, _)| *param).collect();
+                let unnest_args_joined = non_empty
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (_, col_type, _, _))| format!("${}::{}", idx + 1, col_type))
+                    .join(", ");
+
+                let sql = format!(
+                    "INSERT INTO {} ({}) SELECT * FROM UNNEST({}) AS t({})",
+                    #full_table_name, col_names_joined, unnest_args_joined, col_names_joined
+                );
+
+                client.execute(&sql, &params).await
+            }
+        }
+
+        impl #struct_name {
+            pub fn batch() -> #batch_struct_name {
+                #batch_struct_name::new()
+            }
+
+            pub fn batch_with_capacity(capacity: usize) -> #batch_struct_name {
+                #batch_struct_name::with_capacity(capacity)
+            }
+        }
+
+        impl QueryExt<#field_count> for #struct_name {
+            const COLS: [&'static str; #field_count] = [
+                #(#col_names),*
+            ];
+
+            const TABLE_NAME: &'static str = #full_table_name;
+
+            fn to_params(&self) -> [&(dyn ToSql + Sync); #field_count] {
+                [#(#param_refs),*]
+            }
+
+            fn from_row(row: Row) -> Self {
+                Self {
+                    #(#field_extractions),*
+                }
+            }
+        }
+    }
+}
+
+/// Generate only the batch struct (no trait implementation)
+fn gen_batch_struct(
+    table: &TableSchema,
+    type_mappings: &HashMap<String, String>,
+    config: &Config,
+) -> TokenStream {
+    let table_name_camel = table.name.to_upper_camel_case();
+    let struct_name = format_ident!("{}{}", table_name_camel, config.tables.table_struct_suffix);
+    let batch_struct_name = format_ident!("{}Batch", table_name_camel);
+    let full_table_name = format!("{}.{}", table.schema, table.name);
+
+    let batch_fields: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .map(|col| {
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+            let rust_type_str = map_postgres_type_to_rust(col, type_mappings);
+            let rust_type: syn::Type = syn::parse_str(&rust_type_str)
+                .unwrap_or_else(|_| syn::parse_str("String").unwrap());
+            quote! { pub #field_name: Vec<#rust_type> }
+        })
+        .collect();
+
+    let batch_init_fields: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .map(|col| {
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+            quote! { #field_name: Vec::new() }
+        })
+        .collect();
+
+    let batch_init_fields_with_capacity: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .map(|col| {
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+            quote! { #field_name: Vec::with_capacity(capacity) }
+        })
+        .collect();
+
+    // Generate individual named parameters for push method
+    let push_params: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .map(|col| {
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+            let rust_type_str = map_postgres_type_to_rust(col, type_mappings);
+            let rust_type: syn::Type = syn::parse_str(&rust_type_str)
+                .unwrap_or_else(|_| syn::parse_str("String").unwrap());
+            let generic_name = format_ident!("{}", col.name.to_upper_camel_case());
+
+            // Non-default/non-identity columns: regular type
+            // Default/identity columns: impl Into<Option<T>>
+            if col.column_default.is_none() && !col.is_identity {
+                quote! { #field_name: #rust_type }
+            } else {
+                // If the column is nullable, we use the type directly (Option<T>)
+                // If it's NOT nullable but has a default (e.g. created_at), we use Into<Option<T>>
+                if col.is_nullable {
+                    quote! { #field_name: #rust_type }
+                } else {
+                    quote! { #field_name: #generic_name }
+                }
+            }
+        })
+        .collect();
+
+    // Generate generic bounds for default/identity columns only
+    let push_generics: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .filter_map(|col| {
+            // Only generate generic param if it has default AND is NOT nullable
+            // Nullable columns with default just get Option<T> directly
+            if (col.column_default.is_some() || col.is_identity) && !col.is_nullable {
+                let rust_type_str = map_postgres_type_to_rust(col, type_mappings);
+                let rust_type: syn::Type = syn::parse_str(&rust_type_str)
+                    .unwrap_or_else(|_| syn::parse_str("String").unwrap());
+                let generic_name = format_ident!("{}", col.name.to_upper_camel_case());
+                Some(quote! { #generic_name: Into<Option<#rust_type>> })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let push_field_pushes: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .map(|col| {
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+
+            if col.column_default.is_none() && !col.is_identity {
+                // Non-default columns: push directly
+                quote! {
+                    self.#field_name.push(#field_name);
+                }
+            } else {
+                // Default/identity columns
+                if col.is_nullable {
+                    // Nullable with default: push directly (it's already Option<T>)
+                    // If None is passed, we push None, which inserts NULL (overriding default)
+                    quote! {
+                        self.#field_name.push(#field_name);
+                    }
+                } else {
+                    // Non-nullable with default: use Into<Option<T>> logic
+                    // If None is passed, we skip pushing to the Vec.
+                    // Important: For a batch, you must either provide the column for all rows, or for none.
+                    // Mixing Some and None across rows will cause length mismatch validation failure.
+                    quote! {
+                        if let Some(val) = #field_name.into() {
+                            self.#field_name.push(val);
+                        }
+                    }
+                }
+            }
+        })
+        .collect();
+
+    let first_field_name = table
+        .columns
+        .first()
+        .map(|col| format_ident!("{}", col.name.to_snake_case()))
+        .expect("Table must have at least one column");
+
+    let array_col_specs: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .map(|col| {
+            let col_name = &col.name;
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+            let pg_type = map_column_to_pg_type(col);
+            let pg_array_type = format!("{}[]", pg_type);
+            quote! {
+                (#col_name, #pg_array_type, &self.#field_name as &(dyn ToSql + Sync))
+            }
+        })
+        .collect();
+
+    let idx_to_len_arms: Vec<TokenStream> = table
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(idx, col)| {
+            let field_name = format_ident!("{}", col.name.to_snake_case());
+            let idx_lit = proc_macro2::Literal::usize_unsuffixed(idx);
+            quote! {
+                #idx_lit => self.#field_name.len(),
+            }
+        })
+        .collect();
+
+    let push_generics_clause = if push_generics.is_empty() {
+        quote! {}
+    } else {
+        quote! { <#(#push_generics),*> }
+    };
+
+    let field_count = table.columns.len();
+
+    let field_count = table.columns.len();
+
+    // Identify required vs optional columns for better docs
+    let (required_cols, optional_cols): (Vec<_>, Vec<_>) = table
+        .columns
+        .iter()
+        .partition(|col| col.column_default.is_none() && !col.is_identity);
+
+    let optional_col_names = if optional_cols.is_empty() {
+        "None".to_string()
+    } else {
+        optional_cols
+            .iter()
+            .map(|c| format!("\n - {}", c.name))
+            .collect::<String>()
+    };
+
+    let example_args = table
+        .columns
+        .iter()
+        .map(|col| {
+            if col.column_default.is_some() || col.is_identity {
+                "None"
+            } else {
+                // Required: provide a dummy value based on type
+                match col.data_type.as_str() {
+                    "integer" | "bigint" | "smallint" => "1",
+                    "double precision" | "real" | "numeric" => "1.0",
+                    "boolean" => "true",
+                    "text" | "varchar" | "char" => "\"value\".to_string()",
+                    "uuid" => "uuid::Uuid::new_v4()",
+                    "json" | "jsonb" => "serde_json::json!({})",
+                    _ => "\"value\".to_string()", // Fallback
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let usage_doc = format!(
+        " Batch insert builder for {0} using UNNEST\n\n \
+         Columns with defaults/identity can be omitted by passing `None` (for all rows in the batch).\n\n \
+         **Optional columns:** {1}\n\n \
+         Usage:\n \
+         ```rust\n \
+         let mut batch = {0}Batch::new();\n \
+         batch.push({2});\n \
+         batch.exec(&client).await?;\n \
+         ```\n\n \
+         Validation: All non-empty column Vecs must have the same length. Panics if lengths don't match.",
+        table_name_camel, optional_col_names, example_args
+    );
+
+    quote! {
+        #[doc = #usage_doc]
+        pub struct #batch_struct_name {
+            #(#batch_fields),*,
+            _conflict_target: Option<&'static [&'static str]>,
+            _do_update_cols: Option<&'static [&'static str]>,
+        }
+
+        impl #batch_struct_name {
+            pub fn new() -> Self {
+                Self {
+                    #(#batch_init_fields),*,
+                    _conflict_target: None,
+                    _do_update_cols: None,
+                }
+            }
+
+            pub fn with_capacity(capacity: usize) -> Self {
+                Self {
+                    #(#batch_init_fields_with_capacity),*,
+                    _conflict_target: None,
+                    _do_update_cols: None,
+                }
+            }
+
+            #[doc = #usage_doc]
+            pub fn push #push_generics_clause (
+                &mut self,
+                #(#push_params),*
+            ) -> &mut Self {
+                #(#push_field_pushes)*
+                self
+            }
+
+            pub fn on_conflict_do_nothing(&mut self, target_cols: &'static [&'static str]) -> &mut Self {
+                self._conflict_target = Some(target_cols);
+                self._do_update_cols = None;
+                self
+            }
+
+            pub fn on_conflict_do_update(&mut self, target_cols: &'static [&'static str], update_cols: &'static [&'static str]) -> &mut Self {
+                self._conflict_target = Some(target_cols);
+                self._do_update_cols = Some(update_cols);
+                self
+            }
+
+            pub fn is_empty(&self) -> bool {
+                self.#first_field_name.is_empty()
+            }
+
+            pub fn len(&self) -> usize {
+                self.#first_field_name.len()
+            }
+
+            fn prepare_sql(&self) -> (String, Vec<&(dyn ToSql + Sync)>) {
+                if self.is_empty() {
+                    return ("".to_string(), vec![]);
+                }
+
+                let all_cols: [(&str, &str, &(dyn ToSql + Sync)); #field_count] = [
+                    #(#array_col_specs),*
+                ];
+
+                let non_empty: Vec<_> = all_cols
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(idx, (col_name, col_type, param))| {
+                        let len = match idx {
+                            #(#idx_to_len_arms)*
+                            _ => 0,
+                        };
+                        if len > 0 {
+                            Some((col_name, col_type, param, len))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if non_empty.is_empty() {
+                    return ("".to_string(), vec![]);
+                }
+
+                // Validate all non-empty columns have the same length
+                let first_len = non_empty[0].3;
+                for (col_name, _, _, len) in &non_empty {
+                    if *len != first_len {
+                        panic!(
+                            "Batch insert validation failed: Column '{}' has {} values, but expected {} (first non-empty column length)",
+                            col_name, len, first_len
+                        );
+                    }
+                }
+
+                let col_names_joined = non_empty.iter().map(|(name, _, _, _)| *name).join(", ");
+                let params: Vec<_> = non_empty.iter().map(|(_, _, param, _)| *param).collect();
+                let unnest_args_joined = non_empty
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (_, col_type, _, _))| format!("${}::{}", idx + 1, col_type))
+                    .join(", ");
+
+                let mut sql = format!(
+                    "INSERT INTO {} ({}) SELECT * FROM UNNEST({}) AS t({})",
+                    #full_table_name, col_names_joined, unnest_args_joined, col_names_joined
+                );
+
+                if let Some(target) = self._conflict_target {
+                    let target_str = target.join(", ");
+                    sql.push_str(&format!(" ON CONFLICT ({})", target_str));
+
+                    if let Some(update_cols) = self._do_update_cols {
+                        let update_set: Vec<String> = update_cols.iter()
+                            .map(|col| format!("{} = EXCLUDED.{}", col, col))
+                            .collect();
+                        sql.push_str(&format!(" DO UPDATE SET {}", update_set.join(", ")));
+                    } else {
+                        sql.push_str(" DO NOTHING");
+                    }
+                }
+
+                (sql, params)
+            }
+
+            pub async fn exec<C: GenericClient>(&self, client: &C) -> Result<u64, Error> {
+                let (sql, params) = self.prepare_sql();
+                if sql.is_empty() {
+                    return Ok(0);
+                }
+                client.execute(&sql, &params).await
+            }
+
+            pub async fn query<C: GenericClient>(&self, client: &C) -> Result<Vec<#struct_name>, Error> {
+                let (mut sql, params) = self.prepare_sql();
+                if sql.is_empty() {
+                    return Ok(vec![]);
+                }
+
+                sql.push_str(" RETURNING *");
+
+                let rows = client.query(&sql, &params).await?;
+                Ok(rows.into_iter().map(#struct_name::from_row).collect())
+            }
+        }
+    }
+}
+
+/// Generate only the QueryExt trait implementation (no batch struct)
+fn gen_query_ext_impl_only(
+    table: &TableSchema,
+    type_mappings: &HashMap<String, String>,
+    config: &Config,
+) -> TokenStream {
+    let table_name_camel = table.name.to_upper_camel_case();
+    let struct_name = format_ident!("{}{}", table_name_camel, config.tables.table_struct_suffix);
+    let batch_struct_name = format_ident!("{}Batch", table_name_camel);
 
     let field_count = table.columns.len();
     let full_table_name = format!("{}.{}", table.schema, table.name);
@@ -635,6 +1033,16 @@ fn gen_query_ext_impl(
         .collect();
 
     quote! {
+        impl #struct_name {
+            pub fn batch() -> #batch_struct_name {
+                #batch_struct_name::new()
+            }
+
+            pub fn batch_with_capacity(capacity: usize) -> #batch_struct_name {
+                #batch_struct_name::with_capacity(capacity)
+            }
+        }
+
         impl QueryExt<#field_count> for #struct_name {
             const COLS: [&'static str; #field_count] = [
                 #(#col_names),*

@@ -259,6 +259,7 @@ mod tests {
                     is_nullable: false,
                     column_default: Some("nextval('places_id_seq')".to_string()),
                     ordinal_position: 1,
+                    is_identity: false,
                 },
                 ColumnDef {
                     name: "google_id".to_string(),
@@ -267,6 +268,7 @@ mod tests {
                     is_nullable: false,
                     column_default: None,
                     ordinal_position: 2,
+                    is_identity: false,
                 },
                 ColumnDef {
                     name: "rating".to_string(),
@@ -275,6 +277,7 @@ mod tests {
                     is_nullable: true,
                     column_default: None,
                     ordinal_position: 3,
+                    is_identity: false,
                 },
             ],
             primary_keys: vec!["id".to_string()],
@@ -288,10 +291,10 @@ mod tests {
         let tokens = gen_table_struct(&table, &type_mappings, &config);
         let code = tokens.to_string();
 
-        assert!(code.contains("pub struct PlaceTable"));
-        assert!(code.contains("pub id: i64"));
-        assert!(code.contains("pub google_id: String"));
-        assert!(code.contains("pub rating: Option < f64 >"));
+        assert!(code.contains("pub struct PlacesTable"));
+        assert!(code.contains("pub id : i64"));
+        assert!(code.contains("pub google_id : String"));
+        assert!(code.contains("pub rating : Option < f64 >"));
         assert!(code.contains("serde :: Serialize"));
     }
 }
