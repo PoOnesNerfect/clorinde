@@ -53,6 +53,8 @@ pub struct Config {
     pub style: Style,
     /// Custom type settings
     pub types: Types,
+    /// Batch operations code generation settings
+    pub tables: Tables,
     /// The Cargo.toml manifest configuration
     pub manifest: cargo_toml::Manifest,
 }
@@ -126,6 +128,7 @@ impl Default for Config {
                 type_traits_mapping: HashMap::new(),
                 type_attributes_mapping: HashMap::new(),
             },
+            tables: Tables::default(),
             manifest: default_manifest(),
             style: Style::default(),
             static_files: vec![],
@@ -237,6 +240,53 @@ impl TypeMapping {
             TypeMapping::Detailed { borrowed_type, .. } => borrowed_type.as_deref(),
         }
     }
+}
+
+/// Configuration for batch operations generation
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Tables {
+    /// Auto-generate QueryExt trait implementations and complete table structs
+    /// Uses the same database connection as query preparation
+    #[serde(rename = "generate-batch-ops")]
+    pub generate_batch_ops: bool,
+
+    /// Database schema to introspect (e.g., "public")
+    #[serde(default = "default_schema")]
+    pub schema: String,
+
+    /// Tables to include (empty = all tables in schema)
+    #[serde(rename = "include-tables", default)]
+    pub include_tables: Vec<String>,
+
+    /// Tables to exclude from generation
+    #[serde(rename = "exclude-tables", default)]
+    pub exclude_tables: Vec<String>,
+
+    /// Suffix for generated table structs (e.g., "Table" -> PlaceTable)
+    #[serde(rename = "table-struct-suffix", default = "default_table_suffix")]
+    pub table_struct_suffix: String,
+}
+
+impl Default for Tables {
+    fn default() -> Self {
+        Self {
+            generate_batch_ops: false,
+            schema: default_schema(),
+            include_tables: Vec::new(),
+            exclude_tables: vec!["schema_migrations".to_string()],
+            table_struct_suffix: default_table_suffix(),
+        }
+    }
+}
+
+fn default_schema() -> String {
+    "public".to_string()
+}
+
+fn default_table_suffix() -> String {
+    "Table".to_string()
 }
 
 #[allow(deprecated)]
@@ -435,6 +485,36 @@ impl ConfigBuilder {
             type_name.into(),
             traits.into_iter().map(Into::into).collect(),
         );
+        self
+    }
+
+    /// Enable batch operations generation (QueryExt implementations)
+    pub fn enable_batch_ops(mut self, enable: bool) -> Self {
+        self.config.tables.generate_batch_ops = enable;
+        self
+    }
+
+    /// Set database schema to introspect
+    pub fn batch_ops_schema(mut self, schema: impl Into<String>) -> Self {
+        self.config.tables.schema = schema.into();
+        self
+    }
+
+    /// Set tables to include (whitelist)
+    pub fn batch_ops_include_tables(mut self, tables: Vec<String>) -> Self {
+        self.config.tables.include_tables = tables;
+        self
+    }
+
+    /// Set tables to exclude (blacklist)
+    pub fn batch_ops_exclude_tables(mut self, tables: Vec<String>) -> Self {
+        self.config.tables.exclude_tables = tables;
+        self
+    }
+
+    /// Set table struct suffix
+    pub fn batch_ops_table_suffix(mut self, suffix: impl Into<String>) -> Self {
+        self.config.tables.table_struct_suffix = suffix.into();
         self
     }
 

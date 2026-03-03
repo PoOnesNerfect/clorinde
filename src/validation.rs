@@ -1,8 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::{
+    config::Config,
     parser::{Module, NullableIdent, Query, QueryDataStruct, Span, TypeAnnotation},
-    prepare_queries::{PreparedField, PreparedModule},
+    prepare_queries::{PreparedField, PreparedModule, TableStructInfo},
     read_queries::ModuleInfo,
     utils::{STRICT_KEYWORD, find_duplicate},
 };
@@ -99,17 +100,58 @@ pub(crate) fn reference_unknown_type(
     info: &ModuleInfo,
     name: &Span<String>,
     types: &[TypeAnnotation],
+    table_structs: Option<&HashMap<String, crate::prepare_queries::TableStructInfo>>,
+    config: Option<&crate::config::Config>,
     ty: &'static str,
 ) -> Result<(), Box<Error>> {
-    if types.iter().all(|it| it.name != *name) {
-        return Err(Box::new(Error::UnknownNamedType {
+    // Check if it's a declared type
+    if types.iter().any(|it| it.name == *name) {
+        return Ok(());
+    }
+
+    // Check if it's a table struct (if table_structs info is provided)
+    if let (Some(table_structs), Some(config)) = (table_structs, config) {
+        // Extract base name from path like "tables::UserRow" -> "UserRow"
+        let base_name = name.value.rsplit("::").next().unwrap_or(&name.value);
+
+        // Check if it matches a table struct or uses tables:: prefix correctly
+        if table_structs.contains_key(base_name) {
+            let uses_tables_prefix = name.value.contains("tables::");
+            let is_just_struct_name = &name.value == base_name;
+
+            // Accept both "tables::UserRow" and "UserRow" for table structs
+            if uses_tables_prefix || is_just_struct_name {
+                return Ok(());
+            }
+        }
+
+        // Check if user is trying to use tables:: prefix but struct doesn't exist
+        let looks_like_table_struct = name.value.contains("tables::")
+            || base_name.ends_with(&config.tables.table_struct_suffix);
+
+        if looks_like_table_struct {
+            return Err(Box::new(Error::TableStructNotGenerated {
+                src: info.into(),
+                name: name.value.clone(),
+                pos: name.span,
+            }));
+        }
+    } else if name.value.contains("tables::") {
+        // User is trying to use tables:: but table generation is not enabled
+        return Err(Box::new(Error::TableStructNotGenerated {
             src: info.into(),
-            ty,
             name: name.value.clone(),
             pos: name.span,
         }));
     }
-    Ok(())
+
+    // Unknown type
+    Err(Box::new(Error::UnknownNamedType {
+        src: info.into(),
+        ty,
+        name: name.value.clone(),
+        pos: name.span,
+    }))
 }
 
 pub(crate) fn nullable_column_name(
@@ -338,6 +380,8 @@ pub(crate) fn validate_module(
         types,
         queries,
     }: &Module,
+    table_structs: Option<&HashMap<String, TableStructInfo>>,
+    config: Option<&Config>,
 ) -> Result<(), Box<Error>> {
     query_name_already_used(info, queries)?;
     named_type_already_used(info, types)?;
@@ -353,7 +397,7 @@ pub(crate) fn validate_module(
                 if it.inlined() {
                     inline_conflict_declared(info, name, types, ty)?;
                 } else {
-                    reference_unknown_type(info, name, types, ty)?;
+                    reference_unknown_type(info, name, types, table_structs, config, ty)?;
                 }
             }
         }
@@ -409,6 +453,31 @@ pub mod error {
             name: String,
             ty: &'static str,
             #[label("unknown named {ty}")]
+            pos: SourceSpan,
+        },
+        #[error("table struct `{name}` was not generated")]
+        #[diagnostic(help("enable `tables.generate-batch-ops` and include this table in config"))]
+        TableStructNotGenerated {
+            #[source_code]
+            src: NamedSource<Arc<String>>,
+            name: String,
+            #[label("referenced here")]
+            pos: SourceSpan,
+        },
+        #[error("query `{query}` does not match table struct `{table}` columns")]
+        #[diagnostic(help(
+            "{:<20}{expected}\n{:<20}{actual}",
+            "expected columns:",
+            "actual columns:"
+        ))]
+        TableStructShapeMismatch {
+            #[source_code]
+            src: NamedSource<Arc<String>>,
+            table: String,
+            query: String,
+            expected: String,
+            actual: String,
+            #[label("row annotation")]
             pos: SourceSpan,
         },
         #[error("unknown field")]

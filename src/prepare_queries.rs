@@ -11,6 +11,7 @@ use crate::{
     config::Config,
     parser::{Module, NullableIdent, Query, Span, TypeAnnotation},
     read_queries::ModuleInfo,
+    schema_introspection::TableSchema,
     type_registrar::{ClorindeType, TypeRegistrar},
     utils::KEYWORD,
     validation,
@@ -19,6 +20,13 @@ use crate::{
 use self::error::Error;
 
 type ModuleNestedSpecs = std::collections::HashMap<String, std::collections::HashMap<String, bool>>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct TableStructInfo {
+    pub(crate) struct_name: String,
+    pub(crate) path: String,
+    pub(crate) columns: Vec<String>,
+}
 
 /// This data structure is used by Clorinde to generate
 /// all constructs related to this particular query.
@@ -120,6 +128,12 @@ impl PreparedField {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PreparedItemOptions {
+    pub(crate) skip_definition: bool,
+    pub(crate) path_override: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedItem {
     pub(crate) name: Span<String>,
@@ -130,6 +144,8 @@ pub(crate) struct PreparedItem {
     pub(crate) is_ref: bool,
     pub(crate) attributes: Vec<String>,
     pub(crate) attributes_borrowed: Vec<String>,
+    pub(crate) skip_definition: bool,
+    pub(crate) path_override: Option<String>,
 }
 
 impl PreparedItem {
@@ -140,6 +156,7 @@ impl PreparedItem {
         is_implicit: bool,
         attributes: Vec<String>,
         attributes_borrowed: Vec<String>,
+        options: PreparedItemOptions,
     ) -> Self {
         Self {
             name,
@@ -150,16 +167,40 @@ impl PreparedItem {
             traits,
             attributes,
             attributes_borrowed,
+            skip_definition: options.skip_definition,
+            path_override: options.path_override,
         }
     }
 
     pub fn path(&self, ctx: &GenCtx) -> String {
+        if let Some(path) = &self.path_override {
+            return path.clone();
+        }
+
         match ctx.hierarchy {
             ModCtx::Types | ModCtx::SchemaTypes => {
                 unreachable!()
             }
             ModCtx::Queries => self.name.to_string(),
             ModCtx::ClientQueries => format!("super::{}", self.name),
+        }
+    }
+
+    /// Get the borrowed variant path for this item
+    /// For table structs with path_override, appends "Borrowed" to the struct name
+    pub fn borrowed_path(&self, ctx: &GenCtx) -> String {
+        if let Some(path) = &self.path_override {
+            // For paths like "crate::tables::UserRow", convert to "crate::tables::UserRowBorrowed"
+            return format!("{}Borrowed", path);
+        }
+
+        // For regular structs, append Borrowed to the name
+        match ctx.hierarchy {
+            ModCtx::Types | ModCtx::SchemaTypes => {
+                unreachable!()
+            }
+            ModCtx::Queries => format!("{}Borrowed", self.name),
+            ModCtx::ClientQueries => format!("super::{}Borrowed", self.name),
         }
     }
 }
@@ -209,11 +250,21 @@ impl PreparedModule {
         is_implicit: bool,
         attributes: Vec<String>,
         attributes_borrowed: Vec<String>,
+        options: PreparedItemOptions,
     ) -> Result<(usize, Vec<usize>), Error> {
         assert!(!fields.is_empty());
         match map.entry(name.clone()) {
-            Entry::Occupied(o) => {
-                let prev = &o.get();
+            Entry::Occupied(mut o) => {
+                let prev = o.get_mut();
+
+                if options.skip_definition {
+                    prev.skip_definition = true;
+                }
+
+                if prev.path_override.is_none() && options.path_override.is_some() {
+                    prev.path_override = options.path_override.clone();
+                }
+
                 // If the row doesn't contain the same fields as a previously
                 // registered row with the same name...
                 let indexes: Vec<_> = if prev.is_named {
@@ -229,6 +280,7 @@ impl PreparedModule {
                 Ok((o.index(), indexes))
             }
             Entry::Vacant(v) => {
+                let options_clone = options.clone();
                 v.insert(PreparedItem::new(
                     name.clone(),
                     fields.clone(),
@@ -236,6 +288,7 @@ impl PreparedModule {
                     is_implicit,
                     attributes.clone(),
                     attributes_borrowed.clone(),
+                    options,
                 ));
                 Self::add(
                     info,
@@ -246,6 +299,7 @@ impl PreparedModule {
                     is_implicit,
                     attributes,
                     attributes_borrowed,
+                    options_clone,
                 )
             }
         }
@@ -260,6 +314,7 @@ impl PreparedModule {
         is_implicit: bool,
         attributes: Vec<String>,
         attributes_borrowed: Vec<String>,
+        options: PreparedItemOptions,
     ) -> Result<(usize, Vec<usize>), Error> {
         let nom = if fields.len() == 1 && is_implicit {
             name.map(|_| fields[0].unwrapped_name())
@@ -275,6 +330,7 @@ impl PreparedModule {
             is_implicit,
             attributes,
             attributes_borrowed,
+            options,
         )
     }
 
@@ -294,6 +350,7 @@ impl PreparedModule {
             is_implicit,
             vec![],
             vec![],
+            PreparedItemOptions::default(),
         )
     }
 
@@ -326,6 +383,7 @@ pub(crate) fn prepare(
     client: &Client,
     modules: Vec<Module>,
     config: &Config,
+    table_schemas: Option<&[TableSchema]>,
 ) -> Result<Preparation, Error> {
     let stmts = prepare_sql(client, &modules);
     let mut registrar = TypeRegistrar::new(config.clone());
@@ -342,9 +400,11 @@ pub(crate) fn prepare(
         .map(|ty| (*ty).clone())
         .collect();
 
+    let table_structs = build_table_struct_map(config, table_schemas);
+
     for module in modules {
         let (prepared_module, module_nested_specs) =
-            prepare_module(&stmts, module, &mut registrar)?;
+            prepare_module(&stmts, module, &mut registrar, &table_structs, config)?;
 
         prepared_modules.push(prepared_module);
 
@@ -383,8 +443,94 @@ pub(crate) fn prepare(
     })
 }
 
+fn build_table_struct_map(
+    config: &Config,
+    table_schemas: Option<&[TableSchema]>,
+) -> HashMap<String, TableStructInfo> {
+    let mut map = HashMap::new();
+
+    let Some(schemas) = table_schemas else {
+        return map;
+    };
+
+    for table in schemas {
+        let struct_name = format!(
+            "{}{}",
+            table.name.to_upper_camel_case(),
+            config.tables.table_struct_suffix
+        );
+
+        let path = format!("crate::tables::{struct_name}");
+        let columns = table.columns.iter().map(|c| c.name.clone()).collect();
+
+        map.insert(
+            struct_name.clone(),
+            TableStructInfo {
+                struct_name,
+                path,
+                columns,
+            },
+        );
+    }
+
+    map
+}
+
 fn normalize_rust_name(name: &str) -> String {
     name.replace(':', "_")
+}
+
+fn resolve_table_struct<'a>(
+    table_structs: &'a HashMap<String, TableStructInfo>,
+    row_name: &Span<String>,
+    declared_types: &[TypeAnnotation],
+    config: &Config,
+    module_info: &ModuleInfo,
+) -> Result<Option<&'a TableStructInfo>, Error> {
+    // Extract the base name from path like "tables::UserRow" -> "UserRow"
+    let base_name = row_name
+        .value
+        .rsplit("::")
+        .next()
+        .unwrap_or(&row_name.value);
+
+    // Check if this matches a generated table struct
+    if let Some(info) = table_structs.get(base_name) {
+        // Verify that if user specified "tables::", it's correct
+        let uses_tables_prefix = row_name.value.contains("tables::");
+        let is_just_struct_name = row_name.value == base_name;
+
+        // Accept both "tables::UserRow" and "UserRow" for table structs
+        if uses_tables_prefix || is_just_struct_name {
+            return Ok(Some(info));
+        }
+    }
+
+    // Check if this was explicitly declared with --:
+    let declared_type = declared_types
+        .iter()
+        .any(|ty| ty.name.value == row_name.value);
+
+    // Determine if this looks like it should be a table struct
+    let looks_like_table_struct = row_name.value.contains("tables::")
+        || base_name.ends_with(&config.tables.table_struct_suffix);
+
+    // Error if user is trying to use a table struct that doesn't exist
+    if looks_like_table_struct && !declared_type {
+        // Check if the struct name itself exists in the table_structs map
+        // This provides a better error message
+        if !table_structs.contains_key(base_name) {
+            return Err(Error::Validation(Box::new(
+                validation::error::Error::TableStructNotGenerated {
+                    src: module_info.into(),
+                    name: row_name.value.clone(),
+                    pos: row_name.span,
+                },
+            )));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Prepares database custom types
@@ -491,8 +637,10 @@ fn prepare_module(
     stmts: &HashMap<String, Result<Statement, tokio_postgres::Error>>,
     module: Module,
     registrar: &mut TypeRegistrar,
+    table_structs: &HashMap<String, TableStructInfo>,
+    config: &Config,
 ) -> Result<(PreparedModule, ModuleNestedSpecs), Error> {
-    validation::validate_module(&module)?;
+    validation::validate_module(&module, Some(table_structs), Some(config))?;
 
     let mut tmp_prepared_module = PreparedModule {
         info: module.info.clone(),
@@ -514,6 +662,8 @@ fn prepare_module(
             &module.types,
             query,
             &module.info,
+            table_structs,
+            config,
         )?;
 
         // Merge nested specs from this query
@@ -548,6 +698,8 @@ fn prepare_query(
         attributes,
     }: Query,
     module_info: &ModuleInfo,
+    table_structs: &HashMap<String, TableStructInfo>,
+    config: &Config,
 ) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, bool>>, Error> {
     let mut nested_specs: std::collections::HashMap<
         String,
@@ -564,6 +716,8 @@ fn prepare_query(
 
     let (nullable_row_fields, traits, row_name, row_attributes, row_attributes_borrowed) =
         row.name_and_fields(types, &name, None);
+
+    let table_struct = resolve_table_struct(table_structs, &row_name, types, config, module_info)?;
 
     let params_fields = {
         let stmt_params = stmt.params();
@@ -614,6 +768,22 @@ fn prepare_query(
             // If none of the row's columns match the nullable column
             validation::nullable_column_name(&module.info, nullable_col, stmt_cols)
                 .map_err(Error::from)?;
+        }
+
+        if let Some(table_struct) = &table_struct {
+            let actual_cols: Vec<String> = stmt_cols.iter().map(|c| c.name().to_string()).collect();
+            if actual_cols != table_struct.columns {
+                return Err(Error::Validation(Box::new(
+                    validation::error::Error::TableStructShapeMismatch {
+                        src: module_info.into(),
+                        table: table_struct.struct_name.clone(),
+                        query: name.value.clone(),
+                        expected: table_struct.columns.join(", "),
+                        actual: actual_cols.join(", "),
+                        pos: row_name.span,
+                    },
+                )));
+            }
         }
 
         let mut row_fields = Vec::new();
@@ -668,6 +838,12 @@ fn prepare_query(
         row_fields
     };
 
+    let mut row_options = PreparedItemOptions::default();
+    if let Some(table_struct) = table_struct {
+        row_options.skip_definition = true;
+        row_options.path_override = Some(table_struct.path.clone());
+    }
+
     let row_idx = if row_fields.is_empty() {
         None
     } else {
@@ -678,6 +854,7 @@ fn prepare_query(
             row.is_implicit(),
             row_attributes,
             row_attributes_borrowed,
+            row_options,
         )?)
     };
 

@@ -30,6 +30,8 @@ mod versions {
     pub const FUTURES: &str = "0.3.31";
     // https://crates.io/crates/deadpool-postgres
     pub const DEADPOOL_POSTGRES: &str = "0.14.1";
+    // https://crates.io/crates/itertools
+    pub const ITERTOOLS: &str = "0.14";
 }
 
 /// Register use of typed requiring specific dependencies
@@ -361,6 +363,12 @@ pub fn gen_cargo_file(dependency_analysis: &DependencyAnalysis, config: &Config)
         deps.add(
             "futures",
             &DependencyBuilder::new(versions::FUTURES).into_detail(),
+        );
+
+        // itertools for batch operations
+        deps.add(
+            "itertools",
+            &DependencyBuilder::new(versions::ITERTOOLS).into_detail(),
         );
 
         deps.add(

@@ -268,7 +268,7 @@ impl TypeAnnotation {
 
         just("--:")
             .ignore_then(space())
-            .ignore_then(ident())
+            .ignore_then(Self::path_ident())
             .then_ignore(space())
             .then(parse_nullable_ident())
             .then_ignore(space())
@@ -718,7 +718,7 @@ impl QueryDataStruct {
     }
 
     fn parser<'src>() -> impl Parser<'src, &'src str, Self, extra::Err<Simple<'src, char>>> {
-        plain_ident()
+        TypeAnnotation::path_ident()
             .or_not()
             .then_ignore(space())
             .then(parse_nullable_ident().or_not())
