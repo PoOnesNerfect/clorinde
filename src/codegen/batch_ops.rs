@@ -441,7 +441,12 @@ fn gen_query_ext_impl(
 
     let first_field_name = table
         .columns
-        .first()
+        .iter()
+        // Prefer a required (non-default, non-identity) column for is_empty/len checks
+        // because optional/default columns may be omitted in push() and stay empty.
+        .find(|col| !col.is_identity && col.column_default.is_none())
+        .or_else(|| table.columns.iter().find(|col| !col.is_identity))
+        .or_else(|| table.columns.first())
         .map(|col| format_ident!("{}", col.name.to_snake_case()))
         .expect("table must have at least one column");
 
@@ -753,7 +758,12 @@ fn gen_batch_struct(
 
     let first_field_name = table
         .columns
-        .first()
+        .iter()
+        // Prefer a required (non-default, non-identity) column for is_empty/len checks
+        // because optional/default columns may be omitted in push() and stay empty.
+        .find(|col| !col.is_identity && col.column_default.is_none())
+        .or_else(|| table.columns.iter().find(|col| !col.is_identity))
+        .or_else(|| table.columns.first())
         .map(|col| format_ident!("{}", col.name.to_snake_case()))
         .expect("Table must have at least one column");
 
